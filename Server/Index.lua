@@ -15,8 +15,6 @@ end)
 
 Manager.AutoMigrate()
 
-local user = User.Find(1)
-print(user.username)
-
-user.password = "another"
-user:Save()
+local user, total = User.Select(true):Where("username = :0", "test"):Fetch()
+print("Found " .. total .. " users with username test")
+print(NanosTable.Dump(user))

@@ -1,4 +1,5 @@
 local Logger = Package.Require("logger.lua")
+local SelectBuilder = Package.Require("selectbuilder.lua")
 
 local _M = {}
 
@@ -124,8 +125,8 @@ function _M.AddOperationsToModel(model)
     ---@return table instances The instances of the given tables.
     function model.TrackAll(tables, inserted)
         local instances = {}
-        for _, table in pairs(tables) do
-            table.insert(instances, model.Track(table, inserted))
+        for _, t in pairs(tables) do
+            table.insert(instances, model.Track(t, inserted))
         end
         return instances
     end
@@ -161,6 +162,12 @@ function _M.AddOperationsToModel(model)
         local result = model._manager._Select(query)
 
         return model.TrackAll(result)
+    end
+
+    ---Creates a new select query builder for the given model.
+    ---@param withCount boolean? Whether to count the results of the query. (default: false)
+    function model.Select(withCount)
+        return SelectBuilder.new(model, withCount)
     end
 end
 
