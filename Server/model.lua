@@ -27,6 +27,7 @@ function ModelDefinition.new(name)
 
     self.tableName = name
     self.columns = {}
+    self._refs = {}
 
     return self
 end
@@ -99,44 +100,67 @@ function ModelDefinition:Field(name, _type)
         return self
     end
 
-    ---Makes the column a foreign key to the given model.
-    ---@param model table The model to reference to
-    ---@param column string The column to reference to. This is optional, if not given the primary key of the model will be used.
-    ---@return table builder The foreign key builder to specify on delete and on update actions.
-    function col:ForeignKey(model, column)
-        local primKey = column or model:_GetPrimaryKey()
-        local foreignKey = {
-            table = model.tableName,
-            column = primKey
-        }
+    return col
+end
 
-        self.foreignKey = foreignKey
-        self.foreignKey.__index = foreignKey
-        self.foreignKey.__type = "ForeignKey"
+---Creates a foreign key reference to the given model.
+---@param name string The name of the field containing the referenced table.
+---@param model table The model to reference to
+---@param column string The column to reference to. This is optional, if not given the primary key of the model will be used.
+---@return table builder The foreign key builder to specify on delete and on update actions.
+function ModelDefinition:Reference(name, model, column)
+    model = model._definition
 
-        local _this = self
-
-        ---Sets the on delete action
-        function foreignKey:OnDelete(action)
-            self.onDelete = action
-            return self
-        end
-
-        ---Sets the on update action
-        function foreignKey:OnUpdate(action)
-            self.onUpdate = action
-            return self
-        end
-
-        ---Returns back to the column builder
-        function foreignKey:End()
-            return _this
-        end
-
-        return self.foreignKey
+    local primKey = column or model:_GetPrimaryKey()
+    local primKeyCol = model:_GetColumnByName(primKey)
+    if primKeyCol == nil then
+        error("Column '" .. primKey .. "' does not exist in model '" .. model.tableName .. "'")
     end
 
-    return col
+    if not primKeyCol.isPrimaryKey then
+        error("Cannot reference to primary key '" .. primKey .. "' of model '" .. model.tableName .. "'")
+    end
+
+    local foreignKeyField = self:Field(name .. "_id", primKeyCol.type)
+    local foreignKey = {
+        table = model.tableName,
+        column = primKey
+    }
+
+    foreignKeyField._isref = true
+    foreignKeyField.foreignKey = foreignKey
+
+    self._refs[name] = {
+        name = name .. "_id",
+        foreignKey = foreignKey
+    }
+
+    local _this = self
+
+    ---Sets the on delete action
+    function foreignKey:OnDelete(action)
+        self.onDelete = action
+        return self
+    end
+
+    ---Sets the on update action
+    function foreignKey:OnUpdate(action)
+        self.onUpdate = action
+        return self
+    end
+
+    ---Returns back to the column builder
+    function foreignKey:End()
+        return _this
+    end
+
+    return foreignKey
+end
+
+---Activates the soft deletion of this model. When a model is soft deleted, it will not be deleted from the database, but instead a timestamp will be set on the deleted_at column.
+function ModelDefinition:SoftDelete()
+    self.softDelete = true
+    return self
 end
 
 ---Returns the primary key of the model or nil if no primary key is set
@@ -157,9 +181,8 @@ end
 ---Defines a database entity model.
 ---@param name string The name of the model
 ---@param onDefine function The function to define the model. Gets called with the model builder as first argument.
----@param withSoftDelete boolean Whether to add a soft delete column to the model or not. Defaults to false.
 ---@return table model The model.
-function Manager.DefineModel(name, onDefine, withSoftDelete)
+function Manager.DefineModel(name, onDefine)
     if not isValidIdentifier(name) then
         error("Invalid model name '" .. name .. "'")
     end
@@ -172,9 +195,8 @@ function Manager.DefineModel(name, onDefine, withSoftDelete)
         error("Model '" .. name .. "' is already defined")
     end
 
-    withSoftDelete = withSoftDelete or false
-
     local definition = ModelDefinition.new(name)
+    definition.softDelete = false
     onDefine(definition)
 
     local primKey = definition:_GetPrimaryKey()
@@ -183,11 +205,10 @@ function Manager.DefineModel(name, onDefine, withSoftDelete)
     end
 
     local deletedAt = definition:_GetColumnByName("deleted_at")
-    if withSoftDelete and deletedAt == nil then
+    if definition.softDelete and deletedAt == nil then
         definition:Field("deleted_at", DataTypes.INTEGER):Nullable()
     end
 
-    definition.softDelete = withSoftDelete
     Manager._models[name] = definition
 
     local model = {}

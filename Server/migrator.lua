@@ -114,12 +114,11 @@ local function generateAlterQueries(engine, tableName, currentColumns, modelColu
 
         if currentColumn == nil then
             table.insert(queries, "ADD COLUMN " .. column.name .. " " .. DataTypes:GetDatabaseType(engine, column.type) .. (column.isNotNull and " NOT NULL" or "") .. (column.defaultValue and " DEFAULT " .. simple_sql_escape(column.defaultValue or "")) .. (column.isPrimaryKey and " PRIMARY KEY" or "") .. (column.isAutoIncrement and " AUTOINCREMENT" or "") .. (column.isUnique and " UNIQUE" or ""))
-        else
-            -- CURRENTLY NOT SUPPORTED
-            --[[if currentColumn.type ~= column.type then
-                table.insert(queries, "ALTER COLUMN " .. column.name .. " TYPE " .. DataTypes:GetDatabaseType(engine, column.type))
-            end]]--
 
+            if column.foreignKey ~= nil then
+                table.insert(queries, "ADD FOREIGN KEY (" .. column.name .. ") REFERENCES " .. column.foreignKey.table .. "(" .. column.foreignKey.column .. ")" .. (column.foreignKey.onUpdate and " ON UPDATE " .. column.foreignKey.onUpdate or "") .. (column.foreignKey.onDelete and " ON DELETE " .. column.foreignKey.onDelete or ""))
+            end
+        else
             if currentColumn.isNotNull ~= column.isNotNull then
                 table.insert(queries, "ALTER COLUMN " .. column.name .. (column.isNotNull and " SET NOT NULL" or " DROP NOT NULL"))
             end
@@ -169,6 +168,10 @@ local function generateAlterQueries(engine, tableName, currentColumns, modelColu
             end
 
             if modelColumn == nil then
+                if column.foreignKey ~= nil then
+                    table.insert(queries, "DROP FOREIGN KEY " .. column.name)
+                end
+
                 table.insert(queries, "DROP COLUMN " .. column.name)
             end
         end

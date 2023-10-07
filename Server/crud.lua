@@ -1,4 +1,3 @@
-local Logger = Package.Require("logger.lua")
 local SelectBuilder = Package.Require("selectbuilder.lua")
 
 local _M = {}
@@ -17,7 +16,9 @@ function _M.AddOperationsToModel(model)
 
         if fill then
             for _, col in pairs(model._definition.columns) do
-                instance[col.name] = col.defaultValue
+                if not col._isref then
+                    instance[col.name] = col.defaultValue
+                end
             end
         end
 
@@ -30,10 +31,24 @@ function _M.AddOperationsToModel(model)
                 local idx = 0
                 for _, col in pairs(model._definition.columns) do
                     if not col.isAutoIncrement then
-                        table.insert(columns, col.name)
-                        table.insert(values, ":" .. tostring(idx))
-                        table.insert(args, self[col.name])
-                        idx = idx + 1
+                        local colName = col.name
+                        local refDef = model._definition._refs and model._definition._refs[col.name] or nil
+                        local value = self[col.name]
+
+                        if refDef ~= nil then
+                            colName = refDef.name
+
+                            if value ~= nil then
+                                value = value[refDef.foreignKey.column]
+                            end
+                        end
+
+                        if value ~= nil then
+                            table.insert(columns, colName)
+                            table.insert(values, ":" .. tostring(idx))
+                            table.insert(args, value)
+                            idx = idx + 1
+                        end
                     end
                 end
 
@@ -58,8 +73,24 @@ function _M.AddOperationsToModel(model)
                 local args = {}
                 local idx = 0
                 for _, col in pairs(fieldsChanged) do
-                    query = query .. col .. " = :" .. tostring(idx) .. ", "
-                    table.insert(args, self[col])
+                    local colName = col
+                    local refDef = model._definition._refs and model._definition._refs[col] or nil
+                    if refDef ~= nil then
+                        colName = refDef.name
+
+                        local ref = self[col]
+                        local value = nil
+
+                        if ref ~= nil then
+                            value = ref[refDef.foreignKey.column]
+                        end
+
+                        table.insert(args, value)
+                    else
+                        table.insert(args, self[col])
+                    end
+
+                    query = query .. colName .. " = :" .. tostring(idx) .. ", "
                     idx = idx + 1
                 end
 
@@ -99,8 +130,17 @@ function _M.AddOperationsToModel(model)
 
                 rawset(t, k, v)
 
-                if k ~= model._definition:_GetPrimaryKey() then -- Primary key cannot get dirty
-                    table.insert(t._dirty, k)
+                local makeDirty = k
+
+                if instance._model._definition._refs[k] ~= nil then
+                    local refDef = instance._model._definition._refs[k]
+
+                    makeDirty = refDef.name
+                    rawset(t, makeDirty, v[refDef.foreignKey.column])
+                end
+
+                if makeDirty ~= model._definition:_GetPrimaryKey() then -- Primary key cannot get dirty
+                    table.insert(t._dirty, makeDirty)
                 end
             end
         })
