@@ -43,6 +43,19 @@ export function run(em: any, check: (string, any, any) -> void, database: string
     end
 
     check("nebra sti classes", tostring(names["golf"]) .. "," .. tostring(names["actros"]), "CarModel,TruckModel")
+    local trucks = 0
+    local vehicles = 0
+    for _, vehicle in ipairs(all ?? {}) do
+      if vehicle instanceof TruckModel then
+        trucks = trucks + 1
+      end
+
+      if vehicle instanceof VehicleModel then
+        vehicles = vehicles + 1
+      end
+    end
+
+    check("nebra instanceof on tracked entities", trucks .. "/" .. vehicles, "1/2")
   end)
   fresh:getRepository(TruckModel):count(nil, nil, function(count: number?, _: string?): void
     check("nebra sti discriminator value", count, 1)

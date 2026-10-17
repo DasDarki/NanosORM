@@ -26,7 +26,6 @@ DatabaseEngine = { SQLite = 0, MySQL = 1, PostgreSQL = 2 }
 Vector = function(x, y, z) return { X = x, Y = y, Z = z } end
 Rotator = function(p, y, r) return { Pitch = p, Yaw = y, Roll = r } end
 Color = function(r, g, b, a) return { R = r, G = g, B = b, A = a } end
-JSON = { stringify = function() return "{}" end, parse = function() return {} end }
 function req(name) return Package.Require(name .. ".lua") end
 function check(name, got, want)
   local ok = got == want
@@ -120,6 +119,34 @@ local function sqlLiteral(v)
   end
   return "'" .. tostring(v):gsub("'", "''") .. "'"
 end
+
+local function encodeJson(value)
+  local valueType = type(value)
+  if valueType == "table" then
+    if #value > 0 or next(value) == nil then
+      local items = {}
+      for _, item in ipairs(value) do items[#items + 1] = encodeJson(item) end
+      return "[" .. table.concat(items, ",") .. "]"
+    end
+    local keys = {}
+    for key in pairs(value) do keys[#keys + 1] = tostring(key) end
+    table.sort(keys)
+    local entries = {}
+    for _, key in ipairs(keys) do entries[#entries + 1] = string.format("%q", key) .. ":" .. encodeJson(value[key]) end
+    return "{" .. table.concat(entries, ",") .. "}"
+  elseif valueType == "string" then
+    return '"' .. value:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub("\n", "\\n") .. '"'
+  elseif valueType == "number" then
+    return math.type(value) == "integer" and tostring(value) or string.format("%.17g", value)
+  elseif valueType == "boolean" then
+    return tostring(value)
+  end
+  return "null"
+end
+JSON = {
+  stringify = function(value) return encodeJson(value) end,
+  parse = function(text) return decodeJson(text)[1] end
+}
 
 SqlLog = {}
 local Db = {}
