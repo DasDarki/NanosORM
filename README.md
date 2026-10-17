@@ -65,7 +65,8 @@ NanosORM runs as its own nanos world package named `nanos-orm`, which exports th
 
 1. Build it with `nebra build` and copy the `out` folder to `Packages/nanos-orm` of your server.
 2. Add `"nanos-orm"` to `packages_requirements` in the `Package.toml` of your package.
-3. For a Nebra package, also add the dependency for the types and annotations: `nebra add github:DasDarki/NanosORM`.
+3. For a Nebra package, also add the dependency for the types and annotations from the Nebra package registry:
+   `nebra add @DasDarki/nanos-orm`.
 
 See [Getting Started](https://github.com/DasDarki/NanosORM/wiki/Getting-Started) for the details.
 
