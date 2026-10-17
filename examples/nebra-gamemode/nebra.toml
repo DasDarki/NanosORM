@@ -22,4 +22,4 @@ import_statement = "Package.Require(%s)"
 
 [dependencies]
 nanos-world-types = "github:nebra-lang/nanos-world-types"
-nanos-orm = "github:DasDarki/NanosORM"
+nanos-orm = "@dasdarki/nanos-orm"
