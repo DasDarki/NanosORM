@@ -1,0 +1,305 @@
+import { connect, createMigrator, Expr, Agg, Money, Currency, EntityManager } from "nanos-orm"
+import { GuildModel, MemberModel, BadgeModel, OutpostModel, Position, VehicleModel, CarModel, SportsCarModel, TruckModel } from "./Entities"
+
+local passed = 0
+local failed = 0
+
+local function check(name: string, condition: boolean, detail: any = nil): void
+  if condition then
+    passed = passed + 1
+    Console.Log("%s", "[smoke] OK   " .. name)
+  else
+    failed = failed + 1
+    Console.Log("%s", "[smoke] FAIL " .. name .. " (" .. tostring(detail) .. ")")
+  end
+end
+
+local function engineOf(name: string): DatabaseEngine
+  if name == "postgresql" then
+    return DatabaseEngine.PostgreSQL
+  elseif name == "mysql" then
+    return DatabaseEngine.MySQL
+  end
+
+  return DatabaseEngine.SQLite
+end
+
+local function sleep(ms: number, done: () -> void): void
+  Timer.SetTimeout(done, ms)
+end
+
+local async function commitWithDefer(em: EntityManager): any
+  local tx = await em:beginTransaction()
+  defer tx:rollback()
+  local guild = new GuildModel()
+  guild.name = "Deferred"
+  em:persist(guild)
+  return await tx:commit()
+end
+
+local async function failWithDefer(em: EntityManager): any
+  local tx = await em:beginTransaction()
+  defer tx:rollback()
+  local guild = new GuildModel()
+  guild.name = "Never"
+  em:persist(guild)
+  await em:flush()
+  return "left without commit"
+end
+
+export async function run(engineName: string, connectionString: string): string
+  local engine = engineOf(engineName)
+  Console.Log("%s", "[smoke] engine " .. engineName)
+  check("global NanosORM exported", NanosORM ~= nil)
+
+  local em = connect(engine, connectionString)
+  em:getConnection():setLogging(false)
+  local dropped, dropErr = await em:dropSchema()
+  check("dropSchema", dropped, dropErr)
+  local created, createErr = await em:createSchema()
+  check("createSchema", created, createErr)
+
+  local migrator = createMigrator(em, { directory = "Packages/orm-smoke/Server/migrations" })
+  local diff, diffErr = await migrator:diff()
+  check("diff in sync after createSchema", diff ~= nil and #diff.up == 0, diffErr ?? (diff ~= nil and table.concat(diff.up, " ; ") or nil))
+
+  local knights = new GuildModel()
+  knights.name = "Knights"
+  local rogues = new GuildModel()
+  rogues.name = "Rogues"
+  local veteran = new BadgeModel()
+  veteran.title = "veteran"
+  local builder = new BadgeModel()
+  builder.title = "builder"
+  em:persist(veteran)
+  em:persist(builder)
+  for index = 1, 20 do
+    local member = new MemberModel()
+    member.name = string.format("m%02d", index)
+    member.level = index
+    member.wallet = Money.of(index * 1.5, Currency.EUR)
+    if index % 2 == 0 then
+      knights.members:add(member)
+    else
+      rogues.members:add(member)
+    end
+
+    if index % 5 == 0 then
+      member.badges:add(veteran)
+    end
+  end
+
+  em:persist(knights)
+  em:persist(rogues)
+  local flushed, flushErr = await em:flush()
+  check("flush graph with cascade, batch and m2m", flushed, flushErr)
+  check("increment id generated", knights.guildID ~= nil, knights.guildID)
+  check("version starts at 1", knights.members:get(1)!.version == 1, knights.members:get(1)!.version)
+
+  local fresh = connect(engine, connectionString)
+  local guilds, queryErr = await fresh:getRepository(GuildModel):query(nil, { with = { "members.badges" }, orderBy = { "name" } })
+  check("query with nested relations", guilds ~= nil and #guilds == 2, queryErr)
+  if guilds ~= nil then
+    local loadedKnights: any = guilds[1]
+    check("members loaded and ordered", loadedKnights.members:size() == 10 and loadedKnights.members:get(1).name == "m02", loadedKnights.members:size())
+    local veterans = 0
+    for _, member in loadedKnights.members do
+      if member.badges:contains(member.badges:find(function(badge: any): boolean return badge.title == "veteran" end)) then
+        veterans = veterans + 1
+      end
+    end
+
+    check("m2m loaded through join table", veterans == 2, veterans)
+    check("money round trip", tostring(loadedKnights.members:get(1).wallet) == "3.00 EUR", tostring(loadedKnights.members:get(1).wallet))
+  end
+
+  local members = fresh:getRepository(MemberModel)
+  local filtered, filterErr = await members:query({ ["guild.name"] = "Rogues", level = Expr.gte(15), ["badges.title"] = "veteran" }, nil)
+  check("relation path filters", filtered ~= nil and #filtered == 1 and filtered[1].name == "m15", filterErr ?? (filtered ~= nil and #filtered or nil))
+  local counted, countErr = await members:count({ name = Expr.startsWith("M1") })
+  check("count with case insensitive like", counted == 10, countErr ?? counted)
+
+  local first = await connect(engine, connectionString):find(MemberModel, knights.members:get(1)!.memberID)
+  local second = await connect(engine, connectionString):find(MemberModel, knights.members:get(1)!.memberID)
+  first.level = 100
+  local firstSaved = await (EntityManager.create(engine, connectionString)):flush()
+  check("first loader unrelated flush ok", firstSaved == true)
+
+  local emA = connect(engine, connectionString)
+  local emB = connect(engine, connectionString)
+  local a = await emA:find(MemberModel, knights.members:get(1)!.memberID)
+  local b = await emB:find(MemberModel, knights.members:get(1)!.memberID)
+  a.level = 50
+  local aOk, aErr = await emA:flush()
+  check("first concurrent update", aOk, aErr)
+  b.level = 60
+  local bOk, bErr = await emB:flush()
+  check("version conflict detected", not bOk and bErr ~= nil, bErr)
+  local refreshed, refreshErr = await emB:refresh(b)
+  check("refresh after conflict", refreshed and b.level == 50 and b.version == 2, refreshErr ?? b.level)
+
+  local committed, txErr = await em:transactional(async function(tx: any): any
+    local guild = await tx:getRepository(GuildModel):findOneBy({ name = "Knights" })
+    guild.name = "Knights of Nanos"
+    return true
+  end)
+  check("transaction commit", committed, txErr)
+  local rolledBack, reason = await em:transactional(async function(tx: any): any
+    local guild = await tx:getRepository(GuildModel):findOneBy({ name = "Rogues" })
+    guild.name = "Should not be saved"
+    await em:flush()
+    return "cancelled on purpose"
+  end)
+  local rogueCheck = await connect(engine, connectionString):getRepository(GuildModel):findOneBy({ name = "Rogues" })
+  check("transaction rollback", not rolledBack and reason == "cancelled on purpose" and rogueCheck ~= nil, reason)
+
+  local victim = await em:getRepository(GuildModel):findOneBy({ name = "Rogues" })
+  em:remove(victim)
+  local removed, removeErr = await em:flush()
+  check("remove with on delete cascade", removed, removeErr)
+  local remaining = await connect(engine, connectionString):getRepository(MemberModel):count(nil)
+  check("members of removed guild deleted by the database", remaining == 10, remaining)
+
+  local deferCommitted = await commitWithDefer(em)
+  local deferred = await connect(engine, connectionString):getRepository(GuildModel):findOneBy({ name = "Deferred" })
+  check("defer rollback after commit keeps data", deferCommitted == true and deferred ~= nil, deferCommitted)
+  await failWithDefer(em)
+  local never = await connect(engine, connectionString):getRepository(GuildModel):findOneBy({ name = "Never" })
+  check("defer rolls back without commit", never == nil)
+
+  local slowTx = await em:beginTransaction({ timeout = 1 })
+  await sleep(1500)
+  local lateOk, lateErr = await slowTx!:commit()
+  check("real timer rolls back after timeout", not lateOk and lateErr == "The transaction timed out after 1 seconds", lateErr)
+  local afterTimeout = await em:getRepository(GuildModel):count(nil)
+  check("connection free after timeout", afterTimeout ~= nil and afterTimeout > 0, afterTimeout)
+
+  local holder = await em:getRepository(GuildModel):findOneBy({ name = "Knights of Nanos" })
+  local north = new OutpostModel()
+  north.name = "North"
+  north.position.x = 10.5
+  north.position.y = -3
+  north.guild = holder
+  local south = new OutpostModel()
+  south.name = "South"
+  south.guild = holder
+  local spawn = new Position()
+  spawn.x = 1
+  south.spawn = spawn
+  holder.outposts:add(north)
+  holder.outposts:add(south)
+  local outpostsSaved, outpostsErr = await em:flush()
+  check("embedded outposts saved", outpostsSaved, outpostsErr)
+  north.position.y = 42
+  local embeddedSaved = await em:flush()
+  local outpostEm = connect(engine, connectionString)
+  local loadedNorth = (await outpostEm:getRepository(OutpostModel):findBy({ ["position.y"] = 42 }))!
+  check("embedded change and criteria", embeddedSaved and #loadedNorth == 1 and loadedNorth[1].position.x == 10.5, #loadedNorth)
+  check("eager guild joined", loadedNorth[1] ~= nil and NanosORM.isInitialized(loadedNorth[1].guild), nil)
+  local loadedSouth = await outpostEm:getRepository(OutpostModel):findOneBy({ name = "South" })
+  check("nullable embedded round trip", loadedSouth ~= nil and loadedSouth.spawn ~= nil and loadedSouth.spawn.x == 1, nil)
+  holder.outposts:remove(south)
+  local orphanSaved, orphanErr = await em:flush()
+  local outpostCount = await connect(engine, connectionString):getRepository(OutpostModel):count(nil)
+  check("orphan removal deletes removed outpost", orphanSaved and outpostCount == 1, orphanErr ?? outpostCount)
+
+  local memberRepository = em:getRepository(MemberModel)
+  local groups, groupsErr = await memberRepository:aggregate({
+    select = { guild = "guild", guildName = "guild.name", members = Agg.count(), avgLevel = Agg.avg("level"), maxLevel = Agg.max("level") },
+    groupBy = { "guild", "guildName" },
+    having = { members = Expr.gte(1) },
+    orderBy = { "members DESC", "guildName" }
+  })
+  check("aggregate with relation path, having and order", groups ~= nil and #groups >= 1, groupsErr)
+  if groups ~= nil and groups[1] ~= nil then
+    local first = groups[1]
+    check("aggregate types", math.type(first.members) == "integer" and type(first.avgLevel) == "number" and type(first.maxLevel) == "number", tostring(first.members) .. " " .. type(first.avgLevel) .. " " .. type(first.maxLevel))
+    check("aggregate relation reference", first.guild ~= nil and first.guild.guildID ~= nil and getmetatable(first.guild) ~= nil, first.guildName)
+  end
+
+  local built, builtErr = await memberRepository:createQueryBuilder():where({ level = Expr.gte(1) }):orWhere({ name = "nobody" }):orderBy("level DESC"):limit(3):getResult()
+  check("query builder", built ~= nil and #built >= 1 and #built <= 3, builtErr)
+  local builtCount = await memberRepository:createQueryBuilder():where({ level = Expr.gte(1) }):count()
+  check("query builder count", builtCount ~= nil and builtCount >= 1, builtCount)
+
+  local memberTable = em:getConnection():quote(memberRepository:getMetadata().tableName)
+  local nativeRows, nativeErr = await em:nativeQuery("SELECT COUNT(*) AS n FROM " .. memberTable .. " WHERE level >= ? AND name <> 'what?'", { 1 })
+  check("native query", nativeRows ~= nil and tonumber(nativeRows[1].n) ~= nil and tonumber(nativeRows[1].n)! >= 1, nativeErr)
+  local someMembers = (await memberRepository:query(nil, { limit = 2 }))!
+  local ids: any[] = {}
+  for _, member in ipairs(someMembers) do
+    table.insert(ids, member.memberID)
+  end
+
+  local nativeEntities, nativeEntitiesErr = await connect(engine, connectionString):nativeQuery("SELECT * FROM " .. memberTable .. " WHERE member_id IN (?)", { ids }, { entity = MemberModel, with = { "guild" } })
+  check("native query entities with uuid array", nativeEntities ~= nil and #nativeEntities == #ids, nativeEntitiesErr ?? (nativeEntities ~= nil and #nativeEntities or nil))
+  local affected, affectedErr = await em:nativeExecute("UPDATE " .. memberTable .. " SET level = level WHERE member_id = ?", { someMembers[1] })
+  check("native execute with entity param", affected == 1, affectedErr ?? affected)
+
+  local vehicleGuild = await em:getRepository(GuildModel):findOneBy({ name = "Knights of Nanos" })
+  local car = new CarModel()
+  car.name = "golf"
+  car.doors = 5
+  car.guild = vehicleGuild
+  local sports = new SportsCarModel()
+  sports.name = "f40"
+  sports.doors = 2
+  sports.topSpeed = 320
+  local truck = new TruckModel()
+  truck.name = "actros"
+  truck.payload = 18.5
+  em:persist(car)
+  em:persist(sports)
+  em:persist(truck)
+  local vehiclesSaved, vehiclesErr = await em:flush()
+  check("sti persist", vehiclesSaved, vehiclesErr)
+  local vehicleEm = connect(engine, connectionString)
+  local vehicles = (await vehicleEm:getRepository(VehicleModel):query(nil, { orderBy = { "name" } }))!
+  local classes: string[] = {}
+  for _, vehicle in ipairs(vehicles) do
+    table.insert(classes, getmetatable(vehicle).__name)
+  end
+
+  check("sti polymorphic query", table.concat(classes, ",") == "TruckModel,SportsCarModel,CarModel", table.concat(classes, ","))
+  local carCount = await vehicleEm:getRepository(CarModel):count(nil)
+  check("sti subclass query includes descendants", carCount == 2, carCount)
+  local fastCars = await vehicleEm:getRepository(SportsCarModel):findBy({ topSpeed = Expr.gt(300) })
+  check("sti subclass column criteria", fastCars ~= nil and #fastCars == 1 and fastCars[1].topSpeed == 320, nil)
+  local wrongClass = await vehicleEm:find(CarModel, truck.vehicleID)
+  check("sti find with wrong subclass", wrongClass == nil, wrongClass)
+  local doors = await vehicleEm:getRepository(CarModel):aggregate({ select = { doors = Agg.sum("doors") } })
+  check("sti subclass aggregate", doors ~= nil and doors[1].doors == 7, doors ~= nil and doors[1].doors or nil)
+  local afterSti = await migrator:diff()
+  check("sti schema in sync", afterSti ~= nil and #afterSti.up == 0, afterSti ~= nil and table.concat(afterSti.up, " ; ") or nil)
+
+  local generated, generateErr = await migrator:generate()
+  check("generate refuses when in sync", generated == nil and generateErr ~= nil, generateErr)
+
+  local connection = em:getConnection()
+  await connection:execute("DROP TABLE " .. connection:quote("member_badges"), connection:createParams())
+  local path, pathErr = await migrator:generate()
+  check("generate writes a migration for the dropped join table", path ~= nil and File.Exists(path), pathErr ?? path)
+  if path ~= nil then
+    check("file is json", string.sub(path, -5) == ".json", path)
+    local file = new File(path, false)
+    local parsed: any = JSON.parse(file:Read())
+    file:Close()
+    check("json has up and down", parsed ~= nil and #parsed.up >= 1 and #parsed.down >= 1)
+    local status = await migrator:status()
+    check("file discovered as pending", status ~= nil and #status.pending == 1, status ~= nil and #status.pending or nil)
+    local migrated, migrateErr, versions = await migrator:migrate()
+    check("migrate applies it", migrated and versions ~= nil and #versions == 1, migrateErr)
+    local after = await migrator:diff()
+    check("diff in sync after migrate", after ~= nil and #after.up == 0, after ~= nil and table.concat(after.up, " ; ") or nil)
+    local reverted, revertErr = await migrator:down()
+    local afterDown = await migrator:diff()
+    check("down reverts it", reverted and afterDown ~= nil and #afterDown.up > 0, revertErr)
+    local again = await migrator:up()
+    check("up again", again == true)
+    local fresh = createMigrator(connect(engine, connectionString), { directory = "Packages/orm-smoke/Server/migrations" })
+    local freshStatus = await fresh:status()
+    check("new migrator finds the file", freshStatus ~= nil and #freshStatus.executed == 1 and #freshStatus.pending == 0)
+  end
+
+  return passed .. " passed, " .. failed .. " failed"
+end

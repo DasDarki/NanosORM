@@ -1,0 +1,116 @@
+import { Model, Collection, Uuid, Money } from "nanos-orm"
+
+@Entity
+export class GuildModel extends Model
+  @Id
+  @Column(type = "integer")
+  guildID: number? = nil
+
+  @Column(length = 64, unique = true)
+  name: string = ""
+
+  @OneToMany(mappedBy = "guild", orderBy = "name", cascade = "persist")
+  members: Collection<MemberModel> = new Collection()
+
+  @OneToMany(mappedBy = "guild", cascade = "persist", orphanRemoval = true)
+  outposts: Collection<OutpostModel> = new Collection()
+end
+
+@Entity
+@Index(fields = "guild, level")
+export class MemberModel extends Model
+  @Id
+  memberID: Uuid? = nil
+
+  @Column(length = 32)
+  name: string = ""
+
+  @Column(type = "integer")
+  level: number = 1
+
+  @Column(currency = "EUR")
+  wallet: Money? = nil
+
+  @ManyToOne(onDelete = "CASCADE")
+  guild: GuildModel? = nil
+
+  @ManyToMany
+  badges: Collection<BadgeModel> = new Collection()
+
+  @Version
+  version: number? = nil
+end
+
+@Entity
+export class BadgeModel
+  @Id
+  @Column(type = "integer")
+  badgeID: number? = nil
+
+  @Column
+  title: string = ""
+
+  @ManyToMany(mappedBy = "badges")
+  members: Collection<MemberModel> = new Collection()
+end
+
+@Embeddable
+export class Position
+  @Column
+  x: number = 0
+
+  @Column
+  y: number = 0
+end
+
+@Entity
+export class OutpostModel
+  @Id
+  @Column(type = "integer")
+  outpostID: number? = nil
+
+  @Column
+  name: string = ""
+
+  @Embedded
+  position: Position = new Position()
+
+  @Embedded(prefix = "spawn_")
+  spawn: Position? = nil
+
+  @ManyToOne(onDelete = "CASCADE", fetch = "eager")
+  guild: GuildModel? = nil
+end
+
+@Entity
+@Inheritance(column = "kind")
+export abstract class VehicleModel
+  @Id
+  @Column(type = "integer")
+  vehicleID: number? = nil
+
+  @Column
+  name: string = ""
+
+  @ManyToOne(onDelete = "SET NULL")
+  guild: GuildModel? = nil
+end
+
+@Entity
+export class CarModel extends VehicleModel
+  @Column(type = "integer")
+  doors: number = 4
+end
+
+@Entity
+@DiscriminatorValue("sports")
+export class SportsCarModel extends CarModel
+  @Column(type = "integer")
+  topSpeed: number = 0
+end
+
+@Entity
+export class TruckModel extends VehicleModel
+  @Column
+  payload: number = 0
+end

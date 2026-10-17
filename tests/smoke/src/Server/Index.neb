@@ -1,0 +1,10 @@
+import { run } from "./Smoke"
+
+local settings: any = Server.GetCustomSettings()
+local engineName = tostring(settings.engine ?? "sqlite")
+local connectionString = tostring(settings.connection ?? "db=orm-smoke.db")
+
+run(engineName, connectionString, function(summary: string): void
+  Console.Log("%s", "[smoke] DONE " .. summary)
+  Server.Stop()
+end)

@@ -1,0 +1,59 @@
+import { entity } from "nanos-orm"
+
+local Item = entity("Item")
+  :column("id", "integer"):id()
+  :column("name", "string")
+  :build()
+
+local function count(em: any, name: string): number
+  local result = 0
+  em:getRepository(Item):count({ name = name }, function(value: number?, _: string?): void
+    result = value ?? -1
+  end)
+  return result
+end
+
+local async function commitWithDefer(em: any): boolean
+  local tx = await em:beginTransaction()
+  defer tx:rollback()
+  local item = Item.new()
+  item.name = "kept"
+  em:persist(item)
+  await tx:commit()
+  return tx:isActive()
+end
+
+local async function returnEarly(em: any): boolean
+  local tx = await em:beginTransaction()
+  defer tx:rollback()
+  local item = Item.new()
+  item.name = "early"
+  em:persist(item)
+  await em:flush()
+  return true
+end
+
+local async function throwAfterFlush(em: any): boolean
+  local tx = await em:beginTransaction()
+  defer tx:rollback()
+  local item = Item.new()
+  item.name = "thrown"
+  em:persist(item)
+  await em:flush()
+  error("boom")
+end
+
+export function run(em: any, check: (string, any, any) -> void): void
+  em:createSchema(function(_: boolean, _: string?): void end)
+  commitWithDefer(em, function(active: boolean): void
+    check("defer after commit keeps row", count(em, "kept"), 1)
+    check("commit ended tx", active, false)
+  end)
+  returnEarly(em, function(_: boolean): void
+    check("defer rolls back on early return", count(em, "early"), 0)
+  end)
+  local ok, err = pcall(throwAfterFlush, em, function(_: boolean): void end)
+  check("error propagated", ok, false)
+  check("defer rolls back on error", count(em, "thrown"), 0)
+  check("connection free after error", count(em, "kept"), 1)
+end

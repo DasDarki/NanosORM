@@ -1,0 +1,43 @@
+@Embeddable
+export class Position
+  @Column
+  x: number = 0
+
+  @Column
+  y: number = 0
+end
+
+@Entity
+export class Spawn
+  @Id
+  @Column(type = "integer")
+  id: number?
+
+  @Column
+  name: string = ""
+
+  @Embedded
+  position: Position = new Position()
+
+  @Embedded(prefix = "alt_")
+  fallback: Position?
+
+  @Index
+  @Column
+  zone: string = "main"
+end
+
+export function run(em: any, check: (string, any, any) -> void): void
+  em:createSchema(function(_: boolean, _: string?): void end)
+  local spawn = new Spawn()
+  spawn.name = "a"
+  spawn.position.x = 5
+  em:persist(spawn)
+  em:flush(function(_: boolean, _: string?): void end)
+  spawn.position.y = 7
+  check("nebra embedded dirty", NanosORM.isDirty(spawn), true)
+  em:flush(function(_: boolean, _: string?): void end)
+  em:getRepository(Spawn):findBy({ ["position.y"] = 7 }, function(found: any[]?, _: string?): void
+    check("nebra embedded criteria", found ~= nil and #found, 1)
+  end)
+end

@@ -1,0 +1,28 @@
+generate_declarations = false
+name = "nanos-orm-nebra-tests"
+target = "5.4"
+version = "0.1.0"
+source = "src"
+output = "out"
+
+[assets]
+"Package.toml" = "Package.toml"
+
+[dependencies]
+nanos-world-types = "github:nebra-lang/nanos-world-types"
+nanos-orm = "file:../.."
+
+[sides]
+"src/Server/**" = ["server", "shared"]
+
+[code]
+index_base = 1
+import_extension = ".lua"
+import_statement = "Package.Require(%s)"
+import_path = "root"
+
+[rules]
+strict_nil = true
+
+[reflection]
+mode = "none"

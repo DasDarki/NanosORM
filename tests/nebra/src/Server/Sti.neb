@@ -1,0 +1,50 @@
+import { Uuid } from "nanos-orm"
+
+@Entity
+@Inheritance(column = "kind")
+export abstract class VehicleModel
+  @Id
+  vehicleID: Uuid? = nil
+
+  @Column
+  name: string = ""
+end
+
+@Entity
+export class CarModel extends VehicleModel
+  @Column(type = "integer")
+  doors: number = 4
+end
+
+@Entity
+@DiscriminatorValue("heavy")
+export class TruckModel extends VehicleModel
+  @Column
+  payload: number = 0
+end
+
+export function run(em: any, check: (string, any, any) -> void, database: string): void
+  em:createSchema(function(_: boolean, _: string?): void end)
+  local car = new CarModel()
+  car.name = "golf"
+  local truck = new TruckModel()
+  truck.name = "actros"
+  truck.payload = 18
+  em:persist(car)
+  em:persist(truck)
+  em:flush(function(ok: boolean, err: string?): void
+    check("nebra sti flush", ok, true)
+  end)
+  local fresh = NanosORM.connect(DatabaseEngine.SQLite, database)
+  fresh:getRepository(VehicleModel):findAll(function(all: any[]?, _: string?): void
+    local names: { [string]: string } = {}
+    for _, vehicle in ipairs(all ?? {}) do
+      names[vehicle.name] = getmetatable(vehicle).__name
+    end
+
+    check("nebra sti classes", tostring(names["golf"]) .. "," .. tostring(names["actros"]), "CarModel,TruckModel")
+  end)
+  fresh:getRepository(TruckModel):count(nil, nil, function(count: number?, _: string?): void
+    check("nebra sti discriminator value", count, 1)
+  end)
+end
