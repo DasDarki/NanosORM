@@ -1,0 +1,31 @@
+import type { CharacterModel } from "./Character"
+
+@Entity
+@Inheritance(column = "kind")
+export abstract class ItemModel
+  @Id
+  @Column(type = "integer")
+  itemID: number? = nil
+
+  @Column(length = 32)
+  label: string = ""
+
+  @Column(type = "integer")
+  amount: number = 1
+
+  @ManyToOne(onDelete = "CASCADE")
+  owner: CharacterModel? = nil
+end
+
+@Entity
+export class WeaponItem extends ItemModel
+  @Column(type = "integer")
+  ammo: number = 0
+end
+
+@Entity
+@DiscriminatorValue("food")
+export class FoodItem extends ItemModel
+  @Column(type = "integer")
+  calories: number = 0
+end

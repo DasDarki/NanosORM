@@ -1,0 +1,24 @@
+import { Model, Collection, Money, SteamId, DateTime } from "nanos-orm"
+import type { CharacterModel } from "./Character"
+
+@Entity
+export class AccountModel extends Model
+  @Id
+  @Column(type = "integer")
+  accountID: number? = nil
+
+  @Column(unique = true)
+  steamId: SteamId? = nil
+
+  @Column(length = 64)
+  name: string = ""
+
+  @Column(currency = "EUR")
+  bank: Money = Money.of(0)
+
+  @Column
+  lastLogin: DateTime? = nil
+
+  @OneToMany(mappedBy = "account", cascade = "persist, remove", orphanRemoval = true, orderBy = "name")
+  characters: Collection<CharacterModel> = new Collection()
+end

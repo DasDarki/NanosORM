@@ -1,0 +1,25 @@
+runtime_export = "Package.Export(%name, %value)"
+generate_declarations = false
+version = "0.1.0"
+target = "5.4"
+name = "orm-nebra-demo"
+output = "out"
+source = "src"
+
+[assets]
+"Package.toml" = "Package.toml"
+
+[code]
+index_base = 1
+import_path = "root"
+import_extension = ".lua"
+import_statement = "Package.Require(%s)"
+
+[sides]
+"src/Shared/**" = ["shared"]
+"src/Client/**" = ["client", "shared"]
+"src/Server/**" = ["server", "shared"]
+
+[dependencies]
+nanos-world-types = "github:nebra-lang/nanos-world-types"
+nanos-orm = "github:DasDarki/NanosORM"

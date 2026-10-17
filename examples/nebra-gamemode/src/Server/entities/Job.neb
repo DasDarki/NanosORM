@@ -1,0 +1,14 @@
+import { Money } from "nanos-orm"
+
+@Entity
+export class JobModel
+  @Id
+  @Column(type = "integer")
+  jobID: number? = nil
+
+  @Column(length = 32, unique = true)
+  name: string = ""
+
+  @Column(currency = "EUR")
+  salary: Money = Money.of(0)
+end

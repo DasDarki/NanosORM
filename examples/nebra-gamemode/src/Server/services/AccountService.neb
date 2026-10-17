@@ -1,0 +1,98 @@
+import { Money, SteamId, DateTime, Expr } from "nanos-orm"
+import { em } from "../Database"
+import { AccountModel } from "../entities/Account"
+import { CharacterModel } from "../entities/Character"
+import { JobModel } from "../entities/Job"
+import { WeaponItem, FoodItem } from "../entities/Item"
+
+--- Loads the account of a player or creates it on the first join, and starts a character for new accounts.
+export async function login(steam64: string, name: string): AccountModel
+  local steamId = SteamId.fromSteam64(steam64)!
+  local found = await em:getRepository(AccountModel):query({ steamId = steamId }, { with = { "characters.inventory" }, limit = 1 })
+  local account = found ~= nil and found[1] or nil
+  if account == nil then
+    account = new AccountModel()
+    account.steamId = steamId
+    account.name = name
+    account.bank = Money.of(500)
+    local character = new CharacterModel()
+    character.name = name .. " Doe"
+    character.cash = Money.of(50)
+    character.account = account
+    local bread = new FoodItem()
+    bread.label = "Bread"
+    bread.calories = 250
+    bread.owner = character
+    character.inventory:add(bread)
+    account.characters:add(character)
+    em:persist(account)
+  end
+
+  account.lastLogin = DateTime.now()
+  local ok, err = await em:flush()
+  if not ok then
+    error("login of " .. name .. " failed: " .. tostring(err))
+  end
+
+  return account
+end
+
+--- Moves money from the bank of one account to another in a transaction, failing without changes if the bank is too low.
+export async function transfer(from: AccountModel, to: AccountModel, amount: Money): boolean
+  local transaction = await em:beginTransaction()
+  defer transaction!:rollback()
+  if from.bank:compareTo(amount) < 0 then
+    return false
+  end
+
+  from.bank = from.bank:minus(amount)
+  to.bank = to.bank:plus(amount)
+  local ok = await transaction!:commit()
+  return ok
+end
+
+--- Gives every employed character its salary in one transaction.
+export async function paySalaries(): number
+  local paid = 0
+  local ok, err = await em:transactional(async function(_: any): any
+    local workers = await em:getRepository(CharacterModel):findBy({ job = Expr.isNotNull() })
+    for _, worker in ipairs(workers!) do
+      worker.cash = worker.cash:plus(worker.job!.salary)
+      paid = paid + 1
+    end
+
+    return true
+  end)
+  if not ok then
+    error("paying salaries failed: " .. tostring(err))
+  end
+
+  return paid
+end
+
+--- Gives a weapon to a character.
+export function giveWeapon(character: CharacterModel, label: string, ammo: number): WeaponItem
+  local weapon = new WeaponItem()
+  weapon.label = label
+  weapon.ammo = ammo
+  weapon.owner = character
+  character.inventory:add(weapon)
+  return weapon
+end
+
+--- Creates the jobs on an empty database.
+export async function seedJobs(): void
+  local count = await em:getRepository(JobModel):count(nil)
+  if count ~= nil and count > 0 then
+    return
+  end
+
+  for _, entry in ipairs({ { "Police", 120 }, { "Medic", 110 }, { "Taxi", 60 } }) do
+    local job = new JobModel()
+    job.name = entry[1] as string
+    job.salary = Money.of(entry[2] as number)
+    em:persist(job)
+  end
+
+  await em:flush()
+end

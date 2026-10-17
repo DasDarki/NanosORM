@@ -1,0 +1,13 @@
+import { connect, createMigrator, EntityManager, Currency } from "nanos-orm"
+
+Currency.setDefault(Currency.of("EUR")!)
+
+local settings: any = Server.GetCustomSettings()
+
+--- The EntityManager of the game mode, connected with the custom settings nebra_demo_engine and nebra_demo_connection.
+export local em: EntityManager = connect(
+  settings.nebra_demo_engine == "postgresql" and DatabaseEngine.PostgreSQL or DatabaseEngine.SQLite,
+  tostring(settings.nebra_demo_connection ?? "db=nebra-demo.db")
+)
+
+createMigrator(em, { directory = "Packages/orm-nebra-demo/Server/migrations" }):registerCommands("orm")

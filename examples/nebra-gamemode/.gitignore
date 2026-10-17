@@ -1,0 +1,8 @@
+nebra_modules/
+out/
+*.log
+.DS_Store
+.vscode/
+.idea/
+Packages/
+Server/Logs/

@@ -1,0 +1,48 @@
+import { Model, Collection, Money } from "nanos-orm"
+import type { AccountModel } from "./Account"
+import type { JobModel } from "./Job"
+import type { ItemModel } from "./Item"
+
+@Embeddable
+export class Location
+  @Column
+  x: number = 0
+
+  @Column
+  y: number = 0
+
+  @Column
+  z: number = 0
+
+  @Column
+  heading: number = 0
+end
+
+@Entity
+@Index(fields = "account, name")
+export class CharacterModel extends Model
+  @Id
+  @Column(type = "integer")
+  characterID: number? = nil
+
+  @Column(length = 32)
+  name: string = ""
+
+  @Column(currency = "EUR")
+  cash: Money = Money.of(0)
+
+  @Embedded
+  location: Location = new Location()
+
+  @ManyToOne(onDelete = "CASCADE")
+  account: AccountModel? = nil
+
+  @ManyToOne(onDelete = "SET NULL", fetch = "eager")
+  job: JobModel? = nil
+
+  @OneToMany(mappedBy = "owner", cascade = "persist", orphanRemoval = true)
+  inventory: Collection<ItemModel> = new Collection()
+
+  @Version
+  version: number? = nil
+end

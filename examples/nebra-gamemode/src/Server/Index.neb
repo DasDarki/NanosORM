@@ -1,0 +1,106 @@
+import { Money, Expr, Agg } from "nanos-orm"
+import { em } from "./Database"
+import { AccountModel } from "./entities/Account"
+import { CharacterModel } from "./entities/Character"
+import { JobModel } from "./entities/Job"
+import { ItemModel, WeaponItem, FoodItem } from "./entities/Item"
+import { login, transfer, paySalaries, giveWeapon, seedJobs } from "./services/AccountService"
+
+local function log(message: string): void
+  Console.Log("%s", "[nebra-demo] " .. message)
+end
+
+@PlayerEvent("Spawn")
+function onPlayerSpawn(player: Player): void
+  login(player:GetSteamID(), player:GetAccountName(), function(account: AccountModel): void
+    log("welcome back " .. account.name .. ", bank " .. account.bank:format())
+  end)
+end
+
+@ConsoleCommand("demo_accounts")
+function listAccounts(): void
+  em:getRepository(AccountModel):query(nil, { with = { "characters" }, orderBy = { "name" } }, function(accounts: any[]?, err: string?): void
+    if accounts == nil then
+      log("query failed: " .. tostring(err))
+      return
+    end
+
+    for _, account in ipairs(accounts) do
+      log(account.name .. " (" .. tostring(account.steamId) .. ") bank " .. account.bank:format() .. ", " .. account.characters:size() .. " character(s)")
+    end
+  end)
+end
+
+@ConsoleCommand("demo_items")
+function itemStats(): void
+  em:getRepository(ItemModel):aggregate({ select = { owner = "owner.name", items = Agg.count(), total = Agg.sum("amount") }, orderBy = { "owner" } }, function(rows: any[]?, err: string?): void
+    for _, row in ipairs(rows ?? {}) do
+      log(tostring(row.owner) .. ": " .. row.items .. " item stack(s), " .. row.total .. " item(s)")
+    end
+  end)
+end
+
+local async function scenario(): string
+  local migrated, migrateErr, warnings = await em:autoMigrate()
+  if not migrated then
+    return "autoMigrate failed: " .. tostring(migrateErr)
+  end
+
+  for _, warning in ipairs(warnings ?? {}) do
+    log("migration warning: " .. warning)
+  end
+
+  await seedJobs()
+  local alice = await login("76561198000000001", "Alice")
+  local bob = await login("76561198000000002", "Bob")
+  local again = await login("76561198000000001", "Alice")
+  log("same account on second login: " .. tostring(again == alice))
+
+  local police = await em:getRepository(JobModel):findOneBy({ name = "Police" })
+  local aliceCharacter = alice.characters:get(1)!
+  aliceCharacter.job = police
+  aliceCharacter.location.x = 1200.5
+  aliceCharacter.location.heading = 90
+  if aliceCharacter.inventory:size() < 2 then
+    giveWeapon(aliceCharacter, "Pistol", 24)
+  end
+
+  await em:flush()
+
+  local moved = await transfer(alice, bob, Money.of(125))
+  local tooMuch = await transfer(bob, alice, Money.of(100000))
+  log("transfer 125: " .. tostring(moved) .. ", transfer 100000: " .. tostring(tooMuch) .. ", bank alice " .. alice.bank:format() .. " / bob " .. bob.bank:format())
+
+  local paid = await paySalaries()
+  log("salaries paid: " .. paid .. ", alice cash " .. aliceCharacter.cash:format())
+
+  local weapons = await em:getRepository(WeaponItem):count(nil)
+  local food = await em:getRepository(FoodItem):count(nil)
+  local allItems = await em:getRepository(ItemModel):count(nil)
+  log("items: " .. tostring(allItems) .. " total, " .. tostring(weapons) .. " weapon(s), " .. tostring(food) .. " food")
+
+  local rich = await em:getRepository(AccountModel):createQueryBuilder()
+    :where({ bank = Expr.gte(Money.of(400)) })
+    :orderBy("name")
+    :getResult()
+  local richNames: string[] = {}
+  for _, account in ipairs(rich ?? {}) do
+    table.insert(richNames, account.name)
+  end
+
+  log("accounts with at least 400 in the bank: " .. table.concat(richNames, ", "))
+
+  local fresh = (await em:getRepository(CharacterModel):findBy({ ["account.name"] = "Alice" }))!
+  log("alice character " .. fresh[1].name .. " at x=" .. fresh[1].location.x .. ", job " .. tostring(fresh[1].job ~= nil and fresh[1].job.name or nil))
+
+  local rows = await em:nativeQuery("SELECT COUNT(*) AS logins FROM account WHERE last_login IS NOT NULL")
+  log("native query, accounts with a login: " .. tostring(rows ~= nil and rows[1].logins or nil))
+
+  listAccounts()
+  itemStats()
+  return "ok"
+end
+
+scenario(function(result: string): void
+  log("scenario finished: " .. result)
+end)
