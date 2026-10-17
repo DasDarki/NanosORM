@@ -1,0 +1,23 @@
+--- @Id marks a field as primary key. It implies @Column, so both can be combined or @Id can stand alone.
+---
+---     @Id
+---     userID: Uuid
+---
+--- With the default strategy "auto", Uuid ids get a version 7 UUID and integer ids use auto increment.
+--- Use @Id(strategy = "none") for ids that are always set by hand.
+
+export local annotation = {
+    targets = { "ClassField" },
+    params = {
+        strategy = { type = "string", required = false }
+    }
+}
+
+export function apply(target, args)
+    local strategy = args.strategy or "auto"
+    if strategy ~= "auto" and strategy ~= "none" then
+        error("@Id strategy has to be \"auto\" or \"none\", got \"" .. tostring(strategy) .. "\"")
+    end
+
+    return target
+end

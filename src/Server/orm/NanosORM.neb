@@ -1,0 +1,95 @@
+import { EntityBuilder } from "./EntityBuilder"
+import { MetadataRegistry, EntityMetadata, ColumnMetadata } from "./Metadata"
+import { TypeRegistry } from "./TypeRegistry"
+import { ColumnType } from "../types/ColumnType"
+import { ChangeTracker } from "./ChangeTracker"
+import { Connection } from "../dbal/Connection"
+import { Driver } from "../dbal/Driver"
+import { Platform } from "../dbal/Platform"
+import { EntityManager } from "./EntityManager"
+import { Migrator } from "./Migrator"
+import { getCallingPackage } from "./PackageScope"
+
+--- Opens a database connection and returns an EntityManager for it. Keep the pool size at 1 to get transactional flushes.
+--- Options: packages, the nanos world packages whose entities the schema operations like autoMigrate manage besides the package calling
+--- connect, or "*" for the entities of all packages. The calling package is read from the call stack, which a Lua tail call like
+--- "return NanosORM.connect(...)" removes, in that case the EntityManager manages the entities of all packages.
+export function connect(engine: DatabaseEngine, connectionString: string, poolSize: number = 1, options: any = nil): EntityManager
+  return EntityManager.create(engine, connectionString, poolSize, options)
+end
+
+--- Creates a Migrator for versioned schema changes. Options: directory (where the JSON migration files are read and written,
+--- relative to the server directory) and table (the version table).
+export function createMigrator(entityManager: EntityManager, options: any = nil): Migrator
+  return new Migrator(entityManager, options)
+end
+
+--- Creates an EntityManager for a custom driver and platform, for example a driver for another database API or a test driver.
+export function connectWith(driver: Driver, platform: Platform, options: any = nil): EntityManager
+  return new EntityManager(new Connection(driver, platform), options)
+end
+
+--- Starts the mapping of an entity. Pass a class table, or a class name to create a new Lua class. The table name is derived from the class name if omitted.
+export function entity(entityClass: any, tableName: string? = nil): EntityBuilder
+  return new EntityBuilder(entityClass, tableName, false)
+end
+
+--- Starts the mapping of a mapped superclass, which passes its columns on to entities extending it.
+export function mappedSuperclass(entityClass: any): EntityBuilder
+  return new EntityBuilder(entityClass, nil, true)
+end
+
+--- Starts the mapping of an embeddable class, whose columns are stored in the tables of the entities embedding it. Pass a class table,
+--- or a class name to create a new Lua class.
+export function embeddable(embeddableClass: any): EntityBuilder
+  return new EntityBuilder(embeddableClass, nil, false, true)
+end
+
+--- Returns the metadata of an entity class, an entity instance or an entity class name.
+export function getMetadata(target: any): EntityMetadata?
+  if target is string then
+    return MetadataRegistry.getByName(target, getCallingPackage())
+  end
+
+  return MetadataRegistry.get(target) ?? MetadataRegistry.ofEntity(target)
+end
+
+--- Returns the metadata of all mapped classes.
+export function getAllMetadata(): EntityMetadata[]
+  return MetadataRegistry.all()
+end
+
+--- Registers a custom column type by name, and optionally by the class table of its values.
+export function registerType(name: string, factory: (ColumnMetadata) -> ColumnType<any>, typeClass: any = nil): void
+  TypeRegistry.register(name, factory, typeClass)
+end
+
+--- Starts tracking changes of the given entity.
+export function manage(entity: any): void
+  ChangeTracker.manage(entity)
+end
+
+--- Stops tracking changes of the given entity.
+export function detach(entity: any): void
+  ChangeTracker.detach(entity)
+end
+
+--- Returns whether the given column, or any column, of a tracked entity was changed.
+export function isDirty(entity: any, fieldName: string? = nil): boolean
+  return ChangeTracker.isDirty(entity, fieldName)
+end
+
+--- Returns the changed columns of a tracked entity as a table from field name to { old, new }.
+export function getChanges(entity: any): { [string]: { old: any, new: any } }
+  return ChangeTracker.getChanges(entity)
+end
+
+--- Returns whether an entity is fully loaded. References created for foreign keys only know their id until they are loaded.
+export function isInitialized(entity: any): boolean
+  return ChangeTracker.isInitialized(entity)
+end
+
+--- Marks all columns of a tracked entity as clean.
+export function markClean(entity: any): void
+  ChangeTracker.markClean(entity)
+end

@@ -1,0 +1,16 @@
+--- Converts an identifier like "userID", "createdAt" or "HTTPServer" into snake case like "user_id", "created_at" or "http_server".
+export function toSnakeCase(name: string): string
+  local result, _ = string.gsub(name, "(%u+)(%u%l)", "%1_%2")
+  result, _ = string.gsub(result, "([%l%d])(%u)", "%1_%2")
+  return string.lower(result)
+end
+
+--- Derives a table name from a class name. A trailing "Model" is removed and the rest is converted into snake case, so "UserModel" becomes "user".
+export function deriveTableName(className: string): string
+  local name = className
+  if #name > 5 and string.sub(name, -5) == "Model" then
+    name = string.sub(name, 1, -6)
+  end
+
+  return toSnakeCase(name)
+end

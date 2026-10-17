@@ -1,0 +1,396 @@
+--- Runs SQL against a database. Callbacks receive (result, error).
+declare interface NanosORMDriver
+    --- Returns the SQL that references the parameter with the given zero based index, for example ":0" or "?".
+    method getPlaceholder(index: number): string
+    --- Runs a query that returns rows.
+    method select(sql: string, params: any[], callback: (any[]?, string?) -> void): nil
+    --- Runs a statement and returns the number of affected rows.
+    method execute(sql: string, params: any[], callback: (number?, string?) -> void): nil
+    --- Returns whether consecutive statements are guaranteed to run on the same connection, which transactions require.
+    method supportsTransactions(): boolean
+    --- Closes the driver.
+    method close(): nil
+end
+
+--- Describes how a field of an entity is mapped to a column.
+declare interface NanosORMColumnMetadata
+    fieldName: string
+    columnName: string
+    typeRef: any
+    nullable: boolean
+    isId: boolean
+    generation: string
+    unique: boolean
+    length: number?
+    precision: number?
+    scale: number?
+    currency: string?
+    columnType: any
+end
+
+--- Describes how an entity class is mapped to a table.
+declare interface NanosORMEntityMetadata
+    entityClass: any
+    className: string
+    tableName: string
+    isMappedSuperclass: boolean
+    parent: NanosORMEntityMetadata?
+    idColumn: NanosORMColumnMetadata?
+    columns: NanosORMColumnMetadata[]
+    method getColumn(fieldName: string): NanosORMColumnMetadata?
+    method getColumnByName(columnName: string): NanosORMColumnMetadata?
+    method hasColumn(fieldName: any): boolean
+    method getIdColumn(): NanosORMColumnMetadata
+end
+
+--- Builds the mapping of an entity step by step. Column options apply to the column added last.
+declare interface NanosORMEntityBuilder
+    --- Adds a column. The type is a name like "string", "integer", "Uuid", a registered class, an enum table or a ColumnType instance.
+    method column(fieldName: string, typeRef: any, nullable: boolean?): NanosORMEntityBuilder
+    --- Marks the last column as primary key with the strategy "auto" or "none".
+    method id(strategy: string?): NanosORMEntityBuilder
+    --- Overrides the database name of the last column.
+    method name(columnName: string): NanosORMEntityBuilder
+    --- Sets the maximum length of the last column.
+    method length(maxLength: number): NanosORMEntityBuilder
+    --- Sets the precision and scale of the last column.
+    method precision(digits: number, scale: number?): NanosORMEntityBuilder
+    --- Adds or removes a unique constraint on the last column.
+    method unique(flag: boolean?): NanosORMEntityBuilder
+    --- Defines whether the last column, to-one relation or embedded field accepts nil.
+    method nullable(flag: boolean?): NanosORMEntityBuilder
+    --- Sets the currency code of the last column.
+    method currency(code: string): NanosORMEntityBuilder
+    --- Marks the last column as deletion time of soft deleted entities.
+    method softDelete(): NanosORMEntityBuilder
+    --- Marks the last integer column as version number for optimistic locking.
+    method version(): NanosORMEntityBuilder
+    --- Lets the class created by this builder extend the given class, for subclasses of an inheritance hierarchy in Lua.
+    method extends(parentClass: any): NanosORMEntityBuilder
+    --- Makes this entity the root of a single table inheritance hierarchy with the discriminator column, "type" by default.
+    method inheritance(kind: string?, columnName: string?, length: number?): NanosORMEntityBuilder
+    --- Sets the discriminator value of this class, by default the class name in snake case without a Model suffix.
+    method discriminatorValue(value: string): NanosORMEntityBuilder
+    --- Marks the root of an inheritance hierarchy as abstract, so only its subclasses can be persisted.
+    method abstract(): NanosORMEntityBuilder
+    --- Adds a field holding an object of an embeddable class, stored in columns with the prefix, by default the field name and "_".
+    method embedded(fieldName: string, target: any, prefix: string?): NanosORMEntityBuilder
+    --- Adds a ManyToOne relation to the target class or class name.
+    method manyToOne(fieldName: string, target: any): NanosORMEntityBuilder
+    --- Adds a OneToOne relation, the inverse side if mappedBy is given.
+    method oneToOne(fieldName: string, target: any, mappedBy: string?): NanosORMEntityBuilder
+    --- Adds a OneToMany relation, the inverse side of the ManyToOne relation named by mappedBy.
+    method oneToMany(fieldName: string, target: any, mappedBy: string): NanosORMEntityBuilder
+    --- Adds a ManyToMany relation, the inverse side if mappedBy is given.
+    method manyToMany(fieldName: string, target: any, mappedBy: string?): NanosORMEntityBuilder
+    --- Names the field of the inverse side on the target.
+    method inversedBy(fieldName: string): NanosORMEntityBuilder
+    --- Overrides the foreign key column of the last to-one relation.
+    method joinColumn(columnName: string): NanosORMEntityBuilder
+    --- Sets the ON DELETE action of the foreign key of the last relation.
+    method onDelete(action: string): NanosORMEntityBuilder
+    --- Overrides the join table of the last ManyToMany relation.
+    method joinTable(tableName: string, joinColumn: string?, inverseJoinColumn: string?): NanosORMEntityBuilder
+    --- Sets the cascaded operations of the last relation: "persist", "remove", both or "all".
+    method cascade(operations: string): NanosORMEntityBuilder
+    --- Sets whether the last relation is loaded "lazy" (on request) or "eager" (by every query that loads the entity).
+    method fetch(mode: string): NanosORMEntityBuilder
+    --- Deletes related entities removed from the last OneToMany collection or replaced in the last owning OneToOne relation.
+    method orphanRemoval(flag: boolean?): NanosORMEntityBuilder
+    --- Sets the order of loaded items of the last to-many relation.
+    method orderBy(...entries: string): NanosORMEntityBuilder
+    --- Adds an index over the given fields, for example index({ "guild", "rank" }).
+    method index(fields: string[], name: string?): NanosORMEntityBuilder
+    --- Adds a unique constraint over the given fields.
+    method uniqueConstraint(fields: string[], name: string?): NanosORMEntityBuilder
+    --- Resolves the column types, registers the mapping and returns the class table.
+    method build(): any
+end
+
+--- Loads and queries the entities of one class. Callbacks receive (result, error) and can be awaited.
+--- Options are tables with the optional keys orderBy (an array like { "createdAt DESC" }), limit, offset, withDeleted, with (relation paths
+--- to load) and eager (false skips the eager relations).
+declare interface NanosORMRepository
+    method getMetadata(): NanosORMEntityMetadata
+    method find(id: any, callback: (any, string?) -> void): nil
+    method findAll(callback: (any[]?, string?) -> void): nil
+    method findBy(criteria: any, callback: (any[]?, string?) -> void): nil
+    method findOneBy(criteria: any, callback: (any, string?) -> void): nil
+    method query(criteria: any, options: any, callback: (any[]?, string?) -> void): nil
+    method count(criteria: any, options: { withDeleted: boolean? }?, callback: (number?, string?) -> void): nil
+    --- Runs an aggregate query. spec has the keys select (alias to field path or Agg function), where, groupBy, having, orderBy,
+    --- limit, offset and withDeleted. Passes one table per row from the selected aliases to their values.
+    method aggregate(spec: any, callback: (any[]?, string?) -> void): nil
+    --- Starts a QueryBuilder for this entity class.
+    method createQueryBuilder(): NanosORMQueryBuilder
+end
+
+--- Builds a query step by step. where combines criteria with AND, orWhere with OR.
+declare interface NanosORMQueryBuilder
+    method where(criteria: any): NanosORMQueryBuilder
+    method orWhere(criteria: any): NanosORMQueryBuilder
+    method with(...paths: string): NanosORMQueryBuilder
+    method orderBy(...entries: string): NanosORMQueryBuilder
+    method limit(count: number): NanosORMQueryBuilder
+    method offset(count: number): NanosORMQueryBuilder
+    method withDeleted(flag: boolean?): NanosORMQueryBuilder
+    method eager(flag: boolean?): NanosORMQueryBuilder
+    method getCriteria(): any
+    method getOptions(): any
+    method getResult(callback: (any[]?, string?) -> void): nil
+    method getOne(callback: (any, string?) -> void): nil
+    method count(callback: (number?, string?) -> void): nil
+    method aggregate(spec: any, callback: (any[]?, string?) -> void): nil
+end
+
+--- A list of entities of a to-many relation. Loop it with for index, item in collection do. Items are on integer keys, so #, [] and ipairs work.
+--- Changes keep both sides of the relation in sync.
+declare interface NanosORMCollection<T>
+    method size(): number
+    method isEmpty(): boolean
+    method get(index: number): T?
+    method first(): T?
+    method last(): T?
+    method indexOf(item: T): number?
+    method contains(item: T): boolean
+    method add(item: T): nil
+    method remove(item: T): boolean
+    method clear(): nil
+    method toArray(): T[]
+    method iterator(): () -> (number?, T)
+    method forEach(action: (T, number) -> void): nil
+    method filter(predicate: (T) -> boolean): T[]
+    method map(mapper: (T) -> any): any[]
+    method find(predicate: (T) -> boolean): T?
+    method isInitialized(): boolean
+end
+
+--- Manages entities like the Doctrine EntityManager. persist and remove schedule changes, flush writes them.
+declare interface NanosORMEntityManager
+    method getConnection(): any
+    --- Returns the nanos world package this EntityManager was created in, nil if it is unknown.
+    method getPackageName(): string?
+    --- Returns whether the schema operations like autoMigrate manage the table of the entity.
+    method managesSchemaOf(metadata: NanosORMEntityMetadata): boolean
+    method getSchemaTool(): any
+    method createSchema(callback: ((boolean, string?) -> void)?): nil
+    method dropSchema(callback: ((boolean, string?) -> void)?): nil
+    --- Adds missing tables, columns, foreign keys and indexes without dropping anything. The callback also receives warnings.
+    method autoMigrate(callback: ((boolean, string?, string[]?) -> void)?): nil
+    method getRepository(entityClass: any): NanosORMRepository
+    method persist(entity: any): nil
+    method remove(entity: any, force: boolean?): nil
+    method contains(entity: any): boolean
+    method detach(entity: any): nil
+    method clear(): nil
+    method find(entityClass: any, id: any, callback: (any, string?) -> void): nil
+    --- Returns the entity for the id without loading it, an uninitialized reference if it is unknown.
+    method getReference(entityClass: any, id: any): any
+    --- Subscribes to a lifecycle event and returns a function that unsubscribes again. Entity events (prePersist, postPersist, preUpdate,
+    --- postUpdate, preRemove, postRemove, postLoad) call listener(entity, em, extra) and can be limited to a class, flush events
+    --- (preFlush, postFlush) call listener(em).
+    method on(event: string, listener: any, entityClass: any?): () -> void
+    --- Reloads a managed entity from the database, for example after a version conflict.
+    method refresh(entity: any, callback: (boolean, string?) -> void): nil
+    --- Runs a SELECT written by hand with ? placeholders. options.entity reads the rows as entities, options.with loads their relations.
+    method nativeQuery(sql: string, params: any[]?, options: { entity: any, with: any }?, callback: (any[]?, string?) -> void): nil
+    --- Runs a statement written by hand with ? placeholders and passes the number of affected rows.
+    method nativeExecute(sql: string, params: any[]?, callback: (number?, string?) -> void): nil
+    --- Runs work(em, done) in a transaction on this EntityManager. It is flushed and committed when work finishes, returning false
+    --- or an error text rolls back. Transactions nest, only the outermost commits. options.timeout rolls back after that many seconds,
+    --- 30 by default, 0 disables it.
+    method transactional(work: any, options: { timeout: number? }?, callback: ((boolean, string?, any) -> void)?): nil
+    --- Starts a transaction on this EntityManager. End it with the commit or rollback of the passed Transaction, whose rollback does
+    --- nothing after the commit, so "defer transaction:rollback()" right after the start is safe.
+    method beginTransaction(options: { timeout: number? }?, callback: (NanosORMTransaction?, string?) -> void): nil
+    --- Commits the innermost transaction.
+    method commit(callback: ((boolean, string?) -> void)?): nil
+    --- Rolls back the innermost transaction.
+    method rollback(callback: ((boolean, string?) -> void)?): nil
+    --- Returns whether a transaction is active on this EntityManager.
+    method isTransactionActive(): boolean
+    --- Returns how many transactions are nested right now.
+    method getTransactionNestingLevel(): number
+    --- Returns whether a nested rollback marked the active transaction for rollback.
+    method isRollbackOnly(): boolean
+    --- Loads relations of loaded entities with one query per relation and level, for example load(users, { "houses", "guild.leader" }).
+    method load(entities: any, paths: any, callback: (boolean, string?) -> void): nil
+    method flush(callback: ((boolean, string?) -> void)?): nil
+end
+
+--- A transaction of an EntityManager. Ending it a second time does nothing, so its rollback can be deferred.
+declare interface NanosORMTransaction
+    --- Flushes and commits. Nested transactions only end their level. A failing flush or commit rolls everything back.
+    method commit(callback: ((boolean, string?) -> void)?): nil
+    --- Rolls back. Nested transactions mark the outer transaction for rollback, the outermost detaches the entities written inside it.
+    method rollback(callback: ((boolean, string?) -> void)?): nil
+    method isActive(): boolean
+    method getLevel(): number
+    method getEntityManager(): NanosORMEntityManager
+end
+
+--- Creates conditions for criteria. Field conditions are used as field value, groups as array entries:
+--- { level = Expr.gt(5), Expr.anyOf({ username = "a" }, { username = "b" }) }
+declare interface NanosORMExpr
+    function eq(value: any): any
+    function neq(value: any): any
+    function gt(value: any): any
+    function gte(value: any): any
+    function lt(value: any): any
+    function lte(value: any): any
+    function between(lower: any, upper: any): any
+    function isIn(values: any[]): any
+    function notIn(values: any[]): any
+    function isNull(): any
+    function isNotNull(): any
+    function like(pattern: string): any
+    function notLike(pattern: string): any
+    function iLike(pattern: string): any
+    function contains(text: string): any
+    function startsWith(text: string): any
+    function endsWith(text: string): any
+    function anyOf(...criteria: any): any
+    function allOf(...criteria: any): any
+    function negate(criteria: any): any
+end
+
+--- Creates the aggregate functions of Repository.aggregate.
+declare interface NanosORMAgg
+    function count(field: string?): any
+    function countDistinct(field: string): any
+    function sum(field: string): any
+    function avg(field: string): any
+    function min(field: string): any
+    function max(field: string): any
+end
+
+--- Runs versioned schema changes. Callbacks receive (ok, error, versions) and can be awaited.
+declare interface NanosORMMigrator
+    --- Registers migrations defined in code, a single one or an array. Migration files of the directory are loaded automatically.
+    method register(migrations: any): nil
+    method getMigrations(): any[]
+    --- Loads the migration files of the directory that are not registered yet.
+    method loadDirectory(): nil
+    --- Passes { up, down, warnings } of the difference between mapping and database to the callback.
+    method diff(callback: (any, string?) -> void): nil
+    --- Writes a JSON migration file for the difference into the directory. The callback receives the path.
+    method generate(callback: (string?, string?) -> void): nil
+    --- Passes { executed, pending, unknown } to the callback.
+    method status(callback: (any, string?) -> void): nil
+    method migrate(callback: ((boolean, string?, string[]?) -> void)?): nil
+    method up(callback: ((boolean, string?, string[]?) -> void)?): nil
+    method down(callback: ((boolean, string?, string[]?) -> void)?): nil
+    method rollback(steps: number?, callback: ((boolean, string?, string[]?) -> void)?): nil
+    --- Registers the console command, by default "orm".
+    method registerCommands(name: string?): nil
+    --- Runs a console subcommand: status, diff, generate, migrate, up, down, rollback [steps] or auto.
+    method runCommand(subcommand: string, argument: string?): nil
+end
+
+--- The global NanosORM, which holds the exports of the package root module init.neb. Nebra projects import from "nanos-orm" instead,
+--- which reads this global with full types. This declaration types the calls generated by @Entity and documents the global for Lua code.
+declare interface NanosORMStatic
+    Model: any
+    SoftDeleteModel: any
+    DateTime: any
+    StringDateFormat: any
+    ISODateFormat: any
+    SqlDateFormat: any
+    DateLocale: any
+    TimeZone: any
+    DaylightSavingRule: any
+    TransitionRule: any
+    TransitionTimeMode: any
+    Calendar: any
+    DayOfWeek: any
+    TimeUnit: any
+    Duration: any
+    Decimal: any
+    RoundingMode: any
+    Money: any
+    Currency: any
+    Uuid: any
+    SteamId: any
+    Json: any
+    GenerationStrategy: any
+    EnumStorage: any
+    StringColumn: any
+    TextColumn: any
+    IntegerColumn: any
+    NumberColumn: any
+    BooleanColumn: any
+    DateTimeColumn: any
+    DateColumn: any
+    DurationColumn: any
+    DecimalColumn: any
+    MoneyColumn: any
+    UuidColumn: any
+    SteamIdColumn: any
+    JsonColumn: any
+    EnumColumn: any
+    VectorColumn: any
+    RotatorColumn: any
+    ColorColumn: any
+    Connection: any
+    QueryParams: any
+    NanosDriver: any
+    Platform: any
+    SQLitePlatform: any
+    MySQLPlatform: any
+    PostgreSQLPlatform: any
+    EntityManager: any
+    Repository: any
+    SchemaTool: any
+    Expr: NanosORMExpr
+    Transaction: any
+    Agg: NanosORMAgg
+    QueryBuilder: any
+    Collection: any
+    EntityBuilder: any
+    Migrator: any
+    MigrationContext: any
+    RelationKind: any
+    EntityLoader: any
+    Expression: any
+    ExpressionKind: any
+
+    --- Opens a database connection and returns an EntityManager for it. Keep the pool size at 1 to get transactional flushes.
+    function connect(engine: DatabaseEngine, connectionString: string, poolSize: number?, options: { packages: any }?): NanosORMEntityManager
+    --- Creates a Migrator. Options: directory (where JSON migration files are read and written, relative to the server) and table.
+    function createMigrator(entityManager: NanosORMEntityManager, options: any?): NanosORMMigrator
+    --- Creates an EntityManager for a custom driver and platform.
+    function connectWith(driver: NanosORMDriver, platform: any, options: { packages: any }?): NanosORMEntityManager
+    --- Returns the platform describing the SQL dialect of a nanos database engine.
+    function createPlatform(engine: DatabaseEngine): any
+
+    --- Starts the mapping of an entity. Pass a class table, or a class name to create a new Lua class.
+    function entity(entityClass: any, tableName: string?): NanosORMEntityBuilder
+    --- Starts the mapping of a mapped superclass.
+    function mappedSuperclass(entityClass: any): NanosORMEntityBuilder
+    --- Starts the mapping of an embeddable class, which only has columns. Pass a class table, or a class name to create a new Lua class.
+    function embeddable(embeddableClass: any): NanosORMEntityBuilder
+    --- Returns the metadata of an entity class, an entity instance or an entity class name.
+    function getMetadata(target: any): NanosORMEntityMetadata?
+    --- Returns the metadata of all mapped classes.
+    function getAllMetadata(): NanosORMEntityMetadata[]
+    --- Registers a custom column type by name, and optionally by the class table of its values.
+    function registerType(name: string, factory: (NanosORMColumnMetadata) -> any, typeClass: any?): nil
+    --- Starts tracking changes of the given entity.
+    function manage(entity: any): nil
+    --- Stops tracking changes of the given entity.
+    function detach(entity: any): nil
+    --- Returns whether the given column, or any column, of a tracked entity was changed.
+    function isDirty(entity: any, fieldName: string?): boolean
+    --- Returns the changed columns of a tracked entity as a table from field name to { old, new }.
+    function getChanges(entity: any): { [string]: { old: any, new: any } }
+    --- Returns whether an entity is fully loaded. References for foreign keys only know their id until they are loaded.
+    function isInitialized(entity: any): boolean
+    --- Marks all columns of a tracked entity as clean.
+    function markClean(entity: any): nil
+    --- Converts an identifier into snake case, the same way column names are derived.
+    function toSnakeCase(name: string): string
+    --- Derives a table name from a class name, the same way entities without explicit table name do.
+    function deriveTableName(className: string): string
+end
+
+declare NanosORM: NanosORMStatic

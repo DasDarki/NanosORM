@@ -1,0 +1,395 @@
+local MS_PER_SECOND = 1000
+local MS_PER_MINUTE = 60000
+local MS_PER_HOUR = 3600000
+local MS_PER_DAY = 86400000
+local MS_PER_WEEK = 604800000
+
+local UNIT_FACTORS: { [string]: number } = {
+  ms = 1,
+  s = MS_PER_SECOND,
+  m = MS_PER_MINUTE,
+  h = MS_PER_HOUR,
+  d = MS_PER_DAY,
+  w = MS_PER_WEEK
+}
+
+local function truncate(value: number): number
+  return value >= 0 and math.floor(value) or math.ceil(value)
+end
+
+local function toInteger(value: number): number
+  local rounded = truncate(value)
+  return math.tointeger(rounded) ?? rounded
+end
+
+--- An immutable amount of time in milliseconds, which may also be negative.
+export class Duration
+
+  --- A duration of zero.
+  static ZERO: Duration = new Duration(0)
+
+  local _milliseconds: number = 0
+
+  --- Creates a duration from milliseconds. Fractions are truncated.
+  constructor(milliseconds: number)
+    self._milliseconds = toInteger(milliseconds)
+  end
+
+  --- Creates a duration from milliseconds.
+  static function ofMilliseconds(milliseconds: number): Duration
+    return new Duration(milliseconds)
+  end
+
+  --- Creates a duration from seconds.
+  static function ofSeconds(seconds: number): Duration
+    return new Duration(seconds * MS_PER_SECOND)
+  end
+
+  --- Creates a duration from minutes.
+  static function ofMinutes(minutes: number): Duration
+    return new Duration(minutes * MS_PER_MINUTE)
+  end
+
+  --- Creates a duration from hours.
+  static function ofHours(hours: number): Duration
+    return new Duration(hours * MS_PER_HOUR)
+  end
+
+  --- Creates a duration from days of exactly 24 hours.
+  static function ofDays(days: number): Duration
+    return new Duration(days * MS_PER_DAY)
+  end
+
+  --- Creates a duration from weeks of exactly 7 days.
+  static function ofWeeks(weeks: number): Duration
+    return new Duration(weeks * MS_PER_WEEK)
+  end
+
+  --- Creates a duration from its parts.
+  static function of(days: number = 0, hours: number = 0, minutes: number = 0, seconds: number = 0, milliseconds: number = 0): Duration
+    return new Duration(days * MS_PER_DAY + hours * MS_PER_HOUR + minutes * MS_PER_MINUTE + seconds * MS_PER_SECOND + milliseconds)
+  end
+
+  --- Returns the duration between two epoch timestamps in milliseconds.
+  static function between(startEpoch: number, endEpoch: number): Duration
+    return new Duration(endEpoch - startEpoch)
+  end
+
+  --- Parses an ISO 8601 duration like "P2DT3H30M" or "PT0.5S", or a short form like "1d 2h 30m", "90s" or "1h30m".
+  --- Returns nil if the string cannot be parsed.
+  static function parse(text: string): Duration?
+    local trimmed = string.gsub(text, "^%s*(.-)%s*$", "%1")
+    if trimmed == "" then
+      return nil
+    end
+
+    local upper = string.upper(trimmed)
+    local negative = false
+    if string.sub(upper, 1, 1) == "-" then
+      negative = true
+      upper = string.sub(upper, 2)
+      trimmed = string.sub(trimmed, 2)
+    end
+
+    local total = 0
+    if string.sub(upper, 1, 1) == "P" then
+      local datePart, timePart = string.match(upper, "^P([^T]*)T?(.*)$")
+      if datePart == nil or timePart == nil or (datePart == "" and timePart == "") then
+        return nil
+      end
+
+      if string.find(upper, "T", 1, true) ~= nil and timePart == "" then
+        return nil
+      end
+
+      local dateRest = string.gsub(datePart, "(%d+%.?%d*)([WD])", function(amount: string, unit: string): string
+        total = total + (tonumber(amount) ?? 0) * (unit == "W" and MS_PER_WEEK or MS_PER_DAY)
+        return ""
+      end)
+
+      local timeRest = string.gsub(timePart, "(%d+%.?%d*)([HMS])", function(amount: string, unit: string): string
+        local factor = MS_PER_SECOND
+        if unit == "H" then
+          factor = MS_PER_HOUR
+        elseif unit == "M" then
+          factor = MS_PER_MINUTE
+        end
+
+        total = total + (tonumber(amount) ?? 0) * factor
+        return ""
+      end)
+
+      if dateRest ~= "" or timeRest ~= "" then
+        return nil
+      end
+    else
+      local valid = true
+      local rest = string.gsub(string.lower(trimmed), "(%d+%.?%d*)%s*(%a+)", function(amount: string, unit: string): string
+        local factor = UNIT_FACTORS[unit]
+        if factor == nil then
+          valid = false
+          return ""
+        end
+
+        total = total + (tonumber(amount) ?? 0) * factor
+        return ""
+      end)
+
+      if not valid or string.match(rest, "^[%s,]*$") == nil or rest == string.lower(trimmed) then
+        return nil
+      end
+    end
+
+    return new Duration(negative and -total or total)
+  end
+
+  --- Returns the smaller of both durations.
+  static function min(first: Duration, second: Duration): Duration
+    return first:toMilliseconds() <= second:toMilliseconds() and first or second
+  end
+
+  --- Returns the larger of both durations.
+  static function max(first: Duration, second: Duration): Duration
+    return first:toMilliseconds() >= second:toMilliseconds() and first or second
+  end
+
+  --- Returns the total amount of milliseconds.
+  function toMilliseconds(): number
+    return self._milliseconds
+  end
+
+  --- Returns the total amount of whole seconds, truncated towards zero.
+  function toSeconds(): number
+    return toInteger(self._milliseconds / MS_PER_SECOND)
+  end
+
+  --- Returns the total amount of whole minutes, truncated towards zero.
+  function toMinutes(): number
+    return toInteger(self._milliseconds / MS_PER_MINUTE)
+  end
+
+  --- Returns the total amount of whole hours, truncated towards zero.
+  function toHours(): number
+    return toInteger(self._milliseconds / MS_PER_HOUR)
+  end
+
+  --- Returns the total amount of whole days, truncated towards zero.
+  function toDays(): number
+    return toInteger(self._milliseconds / MS_PER_DAY)
+  end
+
+  --- Returns the total amount of seconds including fractions.
+  function toSecondsExact(): number
+    return self._milliseconds / MS_PER_SECOND
+  end
+
+  --- Returns the days part, which is the same as toDays.
+  function getDaysPart(): number
+    return self:toDays()
+  end
+
+  --- Returns the hours part from 0 to 23, negative for negative durations.
+  function getHoursPart(): number
+    return self:toHours() - self:toDays() * 24
+  end
+
+  --- Returns the minutes part from 0 to 59, negative for negative durations.
+  function getMinutesPart(): number
+    return self:toMinutes() - self:toHours() * 60
+  end
+
+  --- Returns the seconds part from 0 to 59, negative for negative durations.
+  function getSecondsPart(): number
+    return self:toSeconds() - self:toMinutes() * 60
+  end
+
+  --- Returns the milliseconds part from 0 to 999, negative for negative durations.
+  function getMillisecondsPart(): number
+    return self._milliseconds - self:toSeconds() * MS_PER_SECOND
+  end
+
+  --- Returns whether this duration is zero.
+  function isZero(): boolean
+    return self._milliseconds == 0
+  end
+
+  --- Returns whether this duration is negative.
+  function isNegative(): boolean
+    return self._milliseconds < 0
+  end
+
+  --- Returns whether this duration is positive.
+  function isPositive(): boolean
+    return self._milliseconds > 0
+  end
+
+  --- Returns the sum of both durations.
+  function plus(other: Duration): Duration
+    return new Duration(self._milliseconds + other:toMilliseconds())
+  end
+
+  --- Returns the difference of both durations.
+  function minus(other: Duration): Duration
+    return new Duration(self._milliseconds - other:toMilliseconds())
+  end
+
+  --- Returns this duration multiplied by the given factor.
+  function multiply(factor: number): Duration
+    return new Duration(self._milliseconds * factor)
+  end
+
+  --- Returns this duration divided by the given divisor.
+  function divide(divisor: number): Duration
+    if divisor == 0 then
+      error("Cannot divide a Duration by zero", 2)
+    end
+
+    return new Duration(self._milliseconds / divisor)
+  end
+
+  --- Returns how many times the other duration fits into this one, including fractions.
+  function ratio(other: Duration): number
+    if other:isZero() then
+      error("Cannot divide a Duration by a zero Duration", 2)
+    end
+
+    return self._milliseconds / other:toMilliseconds()
+  end
+
+  --- Returns the negated duration.
+  function negate(): Duration
+    return new Duration(-self._milliseconds)
+  end
+
+  --- Returns the absolute duration.
+  function abs(): Duration
+    return self._milliseconds < 0 and self:negate() or self
+  end
+
+  --- Returns -1, 0 or 1 depending on whether this duration is shorter, equal or longer than the other.
+  function compareTo(other: Duration): number
+    local difference = self._milliseconds - other:toMilliseconds()
+    if difference < 0 then
+      return -1
+    elseif difference > 0 then
+      return 1
+    end
+
+    return 0
+  end
+
+  --- Returns whether both durations are equally long.
+  function equals(other: Duration): boolean
+    return self._milliseconds == other:toMilliseconds()
+  end
+
+  --- Formats this duration as ISO 8601, for example "PT1H30M" or "P2DT3H".
+  function toISOString(): string
+    if self._milliseconds == 0 then
+      return "PT0S"
+    end
+
+    local absolute = self:abs()
+    local result = self._milliseconds < 0 and "-P" or "P"
+    local days = absolute:toDays()
+    if days ~= 0 then
+      result = result .. days .. "D"
+    end
+
+    local hours = absolute:getHoursPart()
+    local minutes = absolute:getMinutesPart()
+    local seconds = absolute:getSecondsPart()
+    local milliseconds = absolute:getMillisecondsPart()
+    if hours == 0 and minutes == 0 and seconds == 0 and milliseconds == 0 then
+      return result
+    end
+
+    result = result .. "T"
+    if hours ~= 0 then
+      result = result .. hours .. "H"
+    end
+
+    if minutes ~= 0 then
+      result = result .. minutes .. "M"
+    end
+
+    if seconds ~= 0 or milliseconds ~= 0 then
+      if milliseconds ~= 0 then
+        local fraction = string.gsub(string.format("%03d", milliseconds), "0+$", "")
+        result = result .. seconds .. "." .. fraction .. "S"
+      else
+        result = result .. seconds .. "S"
+      end
+    end
+
+    return result
+  end
+
+  --- Formats this duration as a clock like "01:30:05", or "01:30:05.250" with milliseconds. Hours may exceed 24.
+  function toClockString(withMilliseconds: boolean = false): string
+    local absolute = self:abs()
+    local sign = self._milliseconds < 0 and "-" or ""
+    local result = sign .. string.format("%02d:%02d:%02d", absolute:toHours(), absolute:getMinutesPart(), absolute:getSecondsPart())
+    if withMilliseconds then
+      result = result .. string.format(".%03d", absolute:getMillisecondsPart())
+    end
+
+    return result
+  end
+
+  --- Formats this duration in a short readable form like "1d 2h 30m 5s".
+  function toString(): string
+    if self._milliseconds == 0 then
+      return "0s"
+    end
+
+    local absolute = self:abs()
+    local parts: string[] = {}
+    local values: number[] = { absolute:toDays(), absolute:getHoursPart(), absolute:getMinutesPart(), absolute:getSecondsPart(), absolute:getMillisecondsPart() }
+    local units: string[] = { "d", "h", "m", "s", "ms" }
+    for index = 1, #values do
+      if values[index] ~= 0 then
+        table.insert(parts, values[index] .. units[index])
+      end
+    end
+
+    local text = table.concat(parts, " ")
+    return self._milliseconds < 0 and "-" .. text or text
+  end
+
+  function __tostring(): string
+    return self:toString()
+  end
+
+  operator +(other: Duration): Duration
+    return self:plus(other)
+  end
+
+  operator -(other: Duration): Duration
+    return self:minus(other)
+  end
+
+  operator -(): Duration
+    return self:negate()
+  end
+
+  operator *(factor: number): Duration
+    return self:multiply(factor)
+  end
+
+  operator /(divisor: number): Duration
+    return self:divide(divisor)
+  end
+
+  operator ==(other: Duration): boolean
+    return self._milliseconds == other:toMilliseconds()
+  end
+
+  operator <(other: Duration): boolean
+    return self._milliseconds < other:toMilliseconds()
+  end
+
+  operator <=(other: Duration): boolean
+    return self._milliseconds <= other:toMilliseconds()
+  end
+end

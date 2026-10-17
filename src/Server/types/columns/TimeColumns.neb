@@ -1,0 +1,98 @@
+import { ColumnType } from "../ColumnType"
+import { Platform } from "../../dbal/Platform"
+import { DateTime, DateFormat, StringDateFormat, ISODateFormat } from "../DateTime"
+import { TimeZone } from "../TimeZone"
+import { Duration } from "../Duration"
+
+local STORAGE_FORMAT = new StringDateFormat("yyyy-MM-dd HH:mm:ss.SSS", TimeZone.UTC)
+local DATE_FORMAT = new StringDateFormat("yyyy-MM-dd")
+local ISO_UTC_FORMAT = new ISODateFormat(TimeZone.UTC)
+
+local READ_FORMATS: DateFormat[] = {
+  STORAGE_FORMAT,
+  new StringDateFormat("yyyy-MM-dd HH:mm:ss", TimeZone.UTC),
+  new StringDateFormat("yyyy-MM-dd HH:mm:ss.SSSx", TimeZone.UTC),
+  new StringDateFormat("yyyy-MM-dd HH:mm:ssx", TimeZone.UTC),
+  ISO_UTC_FORMAT
+}
+
+--- Stores a DateTime in UTC with millisecond precision. Read values are converted into the given zone, or into the default zone.
+--- Date only values are stored as midnight UTC.
+export class DateTimeColumn implements ColumnType<DateTime>
+
+  local _zone: TimeZone? = nil
+
+  constructor(zone: TimeZone? = nil)
+    self._zone = zone
+  end
+
+  function getSqlType(platform: Platform): string
+    return platform:getDateTimeType()
+  end
+
+  function toDatabase(value: DateTime, platform: Platform): any
+    return platform:convertDateTimeToDatabase(value)
+  end
+
+  function fromDatabase(raw: any, platform: Platform): DateTime?
+    if raw == nil then
+      return nil
+    end
+
+    local zone = self._zone ?? TimeZone.getDefault()
+    if raw is number then
+      return DateTime.fromEpoch(raw, zone)
+    end
+
+    local text = tostring(raw)
+    for index = 1, #READ_FORMATS do
+      local parsed = READ_FORMATS[index]:fromString(text)
+      if parsed ~= nil then
+        return parsed:toDateTime(TimeZone.UTC):withZone(zone)
+      end
+    end
+
+    return nil
+  end
+end
+
+--- Stores the calendar date of a DateTime without any time. Read values are always date only.
+export class DateColumn implements ColumnType<DateTime>
+
+  function getSqlType(platform: Platform): string
+    return platform:getDateType()
+  end
+
+  function toDatabase(value: DateTime, platform: Platform): any
+    return value:toDate():toString(DATE_FORMAT)
+  end
+
+  function fromDatabase(raw: any, platform: Platform): DateTime?
+    if raw == nil then
+      return nil
+    end
+
+    return DATE_FORMAT:fromString(string.sub(tostring(raw), 1, 10))
+  end
+end
+
+--- Stores a Duration as milliseconds in a BIGINT column.
+export class DurationColumn implements ColumnType<Duration>
+
+  function getSqlType(platform: Platform): string
+    return platform:getBigIntType()
+  end
+
+  function toDatabase(value: Duration, platform: Platform): any
+    return value:toMilliseconds()
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Duration?
+    local milliseconds = tonumber(raw)
+    if milliseconds == nil then
+      return nil
+    end
+
+    return new Duration(milliseconds)
+  end
+end

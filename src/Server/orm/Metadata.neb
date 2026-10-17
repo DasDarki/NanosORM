@@ -1,0 +1,1010 @@
+import { ColumnType } from "../types/ColumnType"
+import { toSnakeCase } from "./Naming"
+
+--- Defines how the value of an id column is generated when an entity is persisted without one.
+export enum GenerationStrategy
+  --- Uuid columns get a version 7 UUID and integer columns use auto increment. Other types are not generated.
+  Auto = "auto"
+  --- The value has to be set before persisting.
+  None = "none"
+end
+
+--- Describes how a field of an entity is mapped to a column.
+export class ColumnMetadata
+
+  --- The name of the field on the entity.
+  fieldName: string
+
+  --- The name of the column in the database.
+  columnName: string
+
+  --- The type the column was declared with: a type name like "string" or "Uuid", a registered class, an enum table or a ColumnType instance.
+  typeRef: any = nil
+
+  --- Whether the column accepts nil.
+  nullable: boolean = false
+
+  --- Whether the column is the primary key.
+  isId: boolean = false
+
+  --- How the value of an id column is generated.
+  generation: GenerationStrategy = GenerationStrategy.None
+
+  --- Whether the column has a unique constraint.
+  unique: boolean = false
+
+  --- The maximum length for string columns.
+  length: number? = nil
+
+  --- The precision for decimal columns.
+  precision: number? = nil
+
+  --- The scale for decimal columns.
+  scale: number? = nil
+
+  --- The currency code for money columns.
+  currency: string? = nil
+
+  --- Whether the column holds the deletion time of soft deleted entities.
+  isSoftDelete: boolean = false
+
+  --- Whether the column holds the version number used for optimistic locking.
+  isVersion: boolean = false
+
+  --- Whether the column holds the discriminator of a single table inheritance hierarchy.
+  isDiscriminator: boolean = false
+
+  --- The resolved column type, available after the entity was built.
+  columnType: ColumnType<any>? = nil
+
+  --- The embedded field this column belongs to, for columns of an embeddable.
+  embedded: EmbeddedMetadata? = nil
+
+  --- The field on the embeddable object this column is read from, for columns of an embeddable.
+  property: string? = nil
+
+  constructor(fieldName: string, columnName: string)
+    self.fieldName = fieldName
+    self.columnName = columnName
+  end
+
+  --- Returns the resolved column type. Raises an error if the entity was not built yet.
+  function getColumnType(): ColumnType<any>
+    local columnType = self.columnType
+    if columnType == nil then
+      error("Column '" .. self.fieldName .. "' has no resolved type", 2)
+    end
+
+    return columnType
+  end
+
+  --- Returns a copy of the column under another field and column name.
+  function copy(fieldName: string, columnName: string): ColumnMetadata
+    local result = new ColumnMetadata(fieldName, columnName)
+    result.typeRef = self.typeRef
+    result.nullable = self.nullable
+    result.unique = self.unique
+    result.length = self.length
+    result.precision = self.precision
+    result.scale = self.scale
+    result.currency = self.currency
+    result.columnType = self.columnType
+    return result
+  end
+end
+
+--- Describes a class whose fields are stored in the columns of the entities that embed it, like an address or a position.
+export class EmbeddableMetadata
+
+  --- The class table of the embeddable.
+  embeddableClass: any
+
+  --- The name of the embeddable class.
+  className: string
+
+  --- The columns of the embeddable, named as if it was stored on its own.
+  columns: ColumnMetadata[] = {}
+
+  --- The nanos world package that mapped the embeddable, nil if unknown.
+  packageName: string? = nil
+
+  constructor(embeddableClass: any, className: string, columns: ColumnMetadata[])
+    self.embeddableClass = embeddableClass
+    self.className = className
+    self.columns = columns
+  end
+end
+
+--- Describes a field of an entity that holds an embeddable object, whose fields are stored in prefixed columns of the entity table.
+export class EmbeddedMetadata
+
+  --- The name of the field on the entity.
+  fieldName: string
+
+  --- The metadata of the embeddable class.
+  embeddable: EmbeddableMetadata
+
+  --- The prefix of the column names, like "address_".
+  prefix: string
+
+  --- Whether the field accepts nil, which stores NULL in all of its columns.
+  nullable: boolean = false
+
+  --- The columns of the embeddable on the entity table. Their field names are paths like "address.city".
+  columns: ColumnMetadata[] = {}
+
+  constructor(fieldName: string, embeddable: EmbeddableMetadata, prefix: string, nullable: boolean)
+    self.fieldName = fieldName
+    self.embeddable = embeddable
+    self.prefix = prefix
+    self.nullable = nullable
+    for _, column in ipairs(embeddable.columns) do
+      local copy = column:copy(fieldName .. "." .. column.fieldName, prefix .. column.columnName)
+      copy.nullable = column.nullable or nullable
+      copy.embedded = self
+      copy.property = column.fieldName
+      table.insert(self.columns, copy)
+    end
+  end
+
+  --- Creates an empty instance of the embeddable class.
+  function createInstance(): any
+    return setmetatable({}, self.embeddable.embeddableClass)
+  end
+
+  --- Reads the value of a column from the embeddable object, which may be nil.
+  function readValue(object: any, column: ColumnMetadata): any
+    if object == nil then
+      return nil
+    end
+
+    return object[column.property]
+  end
+end
+
+--- Holds the metadata of all built entities and mapped superclasses.
+export class MetadataRegistry
+
+  local static _byClass: { [any]: EntityMetadata } = {}
+  local static _byName: { [string]: { [string]: EntityMetadata } } = {}
+  local static _embeddablesByClass: { [any]: EmbeddableMetadata } = {}
+  local static _embeddablesByName: { [string]: { [string]: EmbeddableMetadata } } = {}
+
+  --- Registers the metadata of an embeddable class.
+  static function registerEmbeddable(metadata: EmbeddableMetadata): void
+    MetadataRegistry._embeddablesByClass[metadata.embeddableClass] = metadata
+    local packageKey = metadata.packageName ?? ""
+    if MetadataRegistry._embeddablesByName[packageKey] == nil then
+      MetadataRegistry._embeddablesByName[packageKey] = {}
+    end
+
+    MetadataRegistry._embeddablesByName[packageKey][metadata.className] = metadata
+  end
+
+  --- Returns the metadata of an embeddable given as class table or class name. Names are looked up like in getByName.
+  static function getEmbeddable(embeddable: any, packageName: string? = nil): EmbeddableMetadata?
+    if embeddable is string then
+      return MetadataRegistry.findByName(MetadataRegistry._embeddablesByName, embeddable, packageName)
+    end
+
+    return MetadataRegistry._embeddablesByClass[embeddable]
+  end
+
+  --- Registers the given metadata. Registering a class twice replaces the previous metadata.
+  static function register(metadata: EntityMetadata): void
+    MetadataRegistry._byClass[metadata.entityClass] = metadata
+    local packageKey = metadata.packageName ?? ""
+    if MetadataRegistry._byName[packageKey] == nil then
+      MetadataRegistry._byName[packageKey] = {}
+    end
+
+    MetadataRegistry._byName[packageKey][metadata.className] = metadata
+  end
+
+  --- Returns the metadata of exactly the given class.
+  static function get(entityClass: any): EntityMetadata?
+    return MetadataRegistry._byClass[entityClass]
+  end
+
+  --- Returns the metadata of the entity class with the given name.
+  --- Classes of the given package are found first, then classes mapped outside of any package, then a class of another package if only
+  --- one package maps a class with that name.
+  static function getByName(className: string, packageName: string? = nil): EntityMetadata?
+    return MetadataRegistry.findByName(MetadataRegistry._byName, className, packageName)
+  end
+
+  local static function findByName<T>(byPackage: { [string]: { [string]: T } }, className: string, packageName: string?): T?
+    local own = byPackage[packageName ?? ""]
+    if own ~= nil and own[className] ~= nil then
+      return own[className]
+    end
+
+    local unscoped = byPackage[""]
+    if unscoped ~= nil and unscoped[className] ~= nil then
+      return unscoped[className]
+    end
+
+    local found: T? = nil
+    for _, classes in pairs(byPackage) do
+      local candidate = classes[className]
+      if candidate ~= nil then
+        if found ~= nil then
+          return nil
+        end
+
+        found = candidate
+      end
+    end
+
+    return found
+  end
+
+
+  --- Returns the metadata of the given entity instance, based on its class.
+  static function ofEntity(entity: any): EntityMetadata?
+    local entityClass = MetadataRegistry.classOf(entity)
+    if entityClass == nil then
+      return nil
+    end
+
+    return MetadataRegistry._byClass[entityClass]
+  end
+
+  --- Returns the metadata of the closest registered parent class of the given class.
+  static function findParent(entityClass: any): EntityMetadata?
+    local current = MetadataRegistry.parentClassOf(entityClass)
+    while current ~= nil do
+      local metadata = MetadataRegistry._byClass[current]
+      if metadata ~= nil then
+        return metadata
+      end
+
+      current = MetadataRegistry.parentClassOf(current)
+    end
+
+    return nil
+  end
+
+  --- Returns all registered metadata.
+  static function all(): EntityMetadata[]
+    local result: EntityMetadata[] = {}
+    for _, metadata in pairs(MetadataRegistry._byClass) do
+      table.insert(result, metadata as EntityMetadata)
+    end
+
+    return result
+  end
+
+  --- Returns the class table of an entity instance, also for entities with an installed tracking metatable.
+  static function classOf(entity: any): any
+    if type(entity) ~= "table" then
+      return nil
+    end
+
+    local metatable = getmetatable(entity)
+    if metatable == nil then
+      return nil
+    end
+
+    local entityClass = rawget(metatable, "__entityClass")
+    if entityClass ~= nil then
+      return entityClass
+    end
+
+    return metatable
+  end
+
+  --- Returns the parent class table of a Nebra or Lua class table.
+  static function parentClassOf(entityClass: any): any
+    local metatable = getmetatable(entityClass)
+    if metatable ~= nil and type(metatable.__index) == "table" then
+      return metatable.__index
+    end
+
+    return nil
+  end
+end
+
+--- The kinds of relations between entities.
+export enum RelationKind
+  ManyToOne = "manyToOne"
+  OneToOne = "oneToOne"
+  OneToMany = "oneToMany"
+  ManyToMany = "manyToMany"
+end
+
+local function joinKeyName(metadata: EntityMetadata): string
+  local idName = metadata:getIdColumn().columnName
+  local prefix = metadata.tableName .. "_"
+  if string.sub(idName, 1, #prefix) == prefix then
+    return idName
+  end
+
+  return prefix .. idName
+end
+
+--- Describes a relation from a field of an entity to another entity. Targets are referenced by class name and resolved on first use,
+--- so entities may reference classes that are built later.
+---
+--- The owning side holds the foreign key: ManyToOne, and OneToOne or ManyToMany without mappedBy. Only changes of the owning side are written,
+--- the inverse side (OneToMany, and OneToOne or ManyToMany with mappedBy) is read only. Collections keep both sides in sync automatically.
+export class RelationMetadata
+
+  --- The name of the field on the entity.
+  fieldName: string
+
+  --- The kind of the relation.
+  kind: RelationKind
+
+  --- The class name of the target entity.
+  targetName: string
+
+  --- The field of the owning side this inverse side is mapped by.
+  mappedBy: string? = nil
+
+  --- The field of the inverse side on the target, if any.
+  inversedBy: string? = nil
+
+  --- Whether the foreign key of an owning to-one relation accepts nil.
+  nullable: boolean = true
+
+  --- The foreign key column of an owning to-one relation. Defaults to the field name in snake case with "_id" appended.
+  joinColumnName: string? = nil
+
+  --- The ON DELETE action of the foreign key, for example "CASCADE" or "SET NULL".
+  onDelete: string? = nil
+
+  --- The join table of an owning ManyToMany relation.
+  joinTableName: string? = nil
+
+  --- The column of the join table referencing the owning entity.
+  joinTableColumn: string? = nil
+
+  --- The column of the join table referencing the target entity.
+  inverseJoinTableColumn: string? = nil
+
+  --- Whether persisting the entity also persists the related entities.
+  cascadePersist: boolean = false
+
+  --- Whether removing the entity also removes the loaded related entities.
+  cascadeRemove: boolean = false
+
+  --- Whether related entities that are removed from the relation are deleted, for OneToMany and owning OneToOne relations.
+  orphanRemoval: boolean = false
+
+  --- Whether the relation is loaded together with the entity by every query, "lazy" or "eager".
+  fetch: string = "lazy"
+
+  --- The order of loaded collections, for example { "createdAt DESC" }.
+  orderBy: string[]? = nil
+
+  --- The entity the relation belongs to, set when the entity is built.
+  owner: EntityMetadata? = nil
+
+  local _joinColumn: ColumnMetadata? = nil
+
+  constructor(fieldName: string, kind: RelationKind, targetName: string)
+    self.fieldName = fieldName
+    self.kind = kind
+    self.targetName = targetName
+  end
+
+  --- Returns a copy for a subclass inheriting the relation from a mapped superclass.
+  function copy(): RelationMetadata
+    local result = new RelationMetadata(self.fieldName, self.kind, self.targetName)
+    result.mappedBy = self.mappedBy
+    result.inversedBy = self.inversedBy
+    result.nullable = self.nullable
+    result.joinColumnName = self.joinColumnName
+    result.onDelete = self.onDelete
+    result.joinTableName = self.joinTableName
+    result.joinTableColumn = self.joinTableColumn
+    result.inverseJoinTableColumn = self.inverseJoinTableColumn
+    result.cascadePersist = self.cascadePersist
+    result.cascadeRemove = self.cascadeRemove
+    result.orphanRemoval = self.orphanRemoval
+    result.fetch = self.fetch
+    result.orderBy = self.orderBy
+    return result
+  end
+
+  --- Returns whether the relation points to a single entity.
+  function isToOne(): boolean
+    return self.kind == RelationKind.ManyToOne or self.kind == RelationKind.OneToOne
+  end
+
+  --- Returns whether the relation holds a collection.
+  function isToMany(): boolean
+    return self.kind == RelationKind.OneToMany or self.kind == RelationKind.ManyToMany
+  end
+
+  --- Returns whether this side of the relation is written to the database.
+  function isOwningSide(): boolean
+    if self.kind == RelationKind.ManyToOne then
+      return true
+    elseif self.kind == RelationKind.OneToMany then
+      return false
+    end
+
+    return self.mappedBy == nil
+  end
+
+  --- Returns whether the relation is stored in a foreign key column of the owner table.
+  function hasJoinColumn(): boolean
+    return self:isToOne() and self:isOwningSide()
+  end
+
+  --- Returns the entity class that declares the relation.
+  function getOwner(): EntityMetadata
+    local owner = self.owner
+    if owner == nil then
+      error("Relation '" .. self.fieldName .. "' belongs to no entity yet", 2)
+    end
+
+    return owner
+  end
+
+  --- Returns the metadata of the target entity. Raises an error if it was not built.
+  function getTarget(): EntityMetadata
+    local owner = self.owner
+    local target = MetadataRegistry.getByName(self.targetName, owner ~= nil and owner.packageName or nil)
+    if target == nil or target.isMappedSuperclass then
+      error("Relation '" .. self.fieldName .. "' targets '" .. self.targetName .. "', which is not a mapped entity", 2)
+    end
+
+    return target
+  end
+
+  --- Returns the owning relation an inverse side is mapped by.
+  function getMappedRelation(): RelationMetadata
+    local mappedBy = self.mappedBy
+    if mappedBy == nil then
+      error("Relation '" .. self.fieldName .. "' is no inverse side", 2)
+    end
+
+    local owning = self:getTarget():getRelation(mappedBy)
+    if owning == nil or not owning:isOwningSide() then
+      error("Relation '" .. self.fieldName .. "' is mapped by '" .. self.targetName .. "." .. mappedBy .. "', which is no owning relation", 2)
+    end
+
+    return owning
+  end
+
+  --- Returns the relation on the other side, if both sides are mapped.
+  function getOtherSide(): RelationMetadata?
+    if not self:isOwningSide() then
+      return self:getMappedRelation()
+    end
+
+    local target = self:getTarget()
+    local inversedBy = self.inversedBy
+    if inversedBy ~= nil then
+      return target:getRelation(inversedBy)
+    end
+
+    local ownerName = self:getOwner().className
+    for index = 1, #target.relations do
+      local candidate = target.relations[index]
+      if candidate.mappedBy == self.fieldName and candidate.targetName == ownerName then
+        return candidate
+      end
+    end
+
+    return nil
+  end
+
+  --- Returns the foreign key column of an owning to-one relation. Its type is the type of the target id.
+  function getJoinColumn(): ColumnMetadata
+    local cached = self._joinColumn
+    if cached ~= nil then
+      return cached
+    end
+
+    if not self:hasJoinColumn() then
+      error("Relation '" .. self.fieldName .. "' has no join column", 2)
+    end
+
+    local targetId = self:getTarget():getIdColumn()
+    local column = new ColumnMetadata(self.fieldName, self.joinColumnName ?? (toSnakeCase(self.fieldName) .. "_id"))
+    column.typeRef = targetId.typeRef
+    column.columnType = targetId:getColumnType()
+    column.nullable = self.nullable
+    column.unique = self.kind == RelationKind.OneToOne
+    self._joinColumn = column
+    return column
+  end
+
+  --- Returns the join table of a ManyToMany relation, taken from the owning side.
+  function getJoinTableName(): string
+    local owning = self:isOwningSide() and self or self:getMappedRelation()
+    return owning.joinTableName ?? (owning:getOwner().tableName .. "_" .. toSnakeCase(owning.fieldName))
+  end
+
+  --- Returns the join table column referencing the owner of the owning side.
+  function getOwningJoinTableColumn(): string
+    local owning = self:isOwningSide() and self or self:getMappedRelation()
+    return owning.joinTableColumn ?? joinKeyName(owning:getOwner())
+  end
+
+  --- Returns the join table column referencing the target of the owning side.
+  function getInverseJoinTableColumn(): string
+    local owning = self:isOwningSide() and self or self:getMappedRelation()
+    local explicit = owning.inverseJoinTableColumn
+    if explicit ~= nil then
+      return explicit
+    end
+
+    local name = joinKeyName(owning:getTarget())
+    if name == owning:getOwningJoinTableColumn() then
+      return toSnakeCase(owning.fieldName) .. "_" .. name
+    end
+
+    return name
+  end
+
+  --- Returns the join table column referencing the entity declaring this side.
+  function getSelfJoinTableColumn(): string
+    return self:isOwningSide() and self:getOwningJoinTableColumn() or self:getInverseJoinTableColumn()
+  end
+
+  --- Returns the join table column referencing the target of this side.
+  function getTargetJoinTableColumn(): string
+    return self:isOwningSide() and self:getInverseJoinTableColumn() or self:getOwningJoinTableColumn()
+  end
+end
+
+--- Describes an index or unique constraint over one or more fields of an entity. Fields may be columns or owning to-one relations,
+--- which are indexed by their foreign key column.
+export class IndexMetadata
+
+  --- The fields of the index in order.
+  fields: string[]
+
+  --- Whether the index is a unique constraint.
+  unique: boolean = false
+
+  --- The explicit name, if any. Without it the name is derived from the table and columns.
+  name: string? = nil
+
+  constructor(fields: string[], unique: boolean, name: string?)
+    self.fields = fields
+    self.unique = unique
+    self.name = name
+  end
+
+  --- Returns the column names of the fields on the given entity.
+  function getColumnNames(metadata: EntityMetadata): string[]
+    local result: string[] = {}
+    for _, fieldName in ipairs(self.fields) do
+      local column = metadata:getColumnOrJoinColumn(fieldName)
+      if column == nil then
+        error("The index of '" .. metadata.className .. "' references '" .. fieldName .. "', which is no column or owning to-one relation", 2)
+      end
+
+      table.insert(result, column.columnName)
+    end
+
+    return result
+  end
+
+  --- Returns the name of the index on the given entity, like "idx_player_guild_id_rank" or "uniq_player_name".
+  function getName(metadata: EntityMetadata): string
+    local explicit = self.name
+    if explicit ~= nil then
+      return explicit
+    end
+
+    return (self.unique and "uniq_" or "idx_") .. metadata.tableName .. "_" .. table.concat(self:getColumnNames(metadata), "_")
+  end
+end
+
+--- Describes how an entity class is mapped to a table.
+export class EntityMetadata
+
+  --- The class table of the entity.
+  entityClass: any
+
+  --- The name of the entity class.
+  className: string
+
+  --- The name of the table.
+  tableName: string
+
+  --- Whether this is a mapped superclass, which only provides columns to its subclasses and has no table of its own.
+  isMappedSuperclass: boolean = false
+
+  --- The metadata of the closest mapped parent class, if any.
+  parent: EntityMetadata? = nil
+
+  --- The id column, if any.
+  idColumn: ColumnMetadata? = nil
+
+  --- The column holding the deletion time if entities are soft deleted, if any.
+  softDeleteColumn: ColumnMetadata? = nil
+
+  --- The column holding the version number for optimistic locking, if any.
+  versionColumn: ColumnMetadata? = nil
+
+  --- All columns including the inherited ones, in declaration order starting with the parent columns.
+  columns: ColumnMetadata[] = {}
+
+  --- All relations including the inherited ones.
+  relations: RelationMetadata[] = {}
+
+  --- All embedded fields including the inherited ones.
+  embeddeds: EmbeddedMetadata[] = {}
+
+  --- All indexes and unique constraints including the inherited ones.
+  indexes: IndexMetadata[] = {}
+
+  --- The metatable used for change tracking, created on first use.
+  trackingMetatable: any = nil
+
+  --- The root entity of the single table inheritance hierarchy the entity belongs to, if any. The root refers to itself.
+  inheritanceRoot: EntityMetadata? = nil
+
+  --- The column holding the discriminator in single table inheritance, shared by the whole hierarchy.
+  discriminatorColumn: ColumnMetadata? = nil
+
+  --- The discriminator value stored for instances of exactly this class. Nil for an abstract root, which cannot be persisted.
+  discriminatorValue: string? = nil
+
+  --- The nanos world package that mapped the entity, nil if unknown. Relation targets are looked up in it first.
+  packageName: string? = nil
+
+  local _columnsByField: { [string]: ColumnMetadata } = {}
+  local _columnsByName: { [string]: ColumnMetadata } = {}
+  local _relationsByField: { [string]: RelationMetadata } = {}
+  local _embeddedsByField: { [string]: EmbeddedMetadata } = {}
+  local _tableColumns: ColumnMetadata[] = {}
+  local _members: EntityMetadata[] = {}
+  local _discriminatorMap: { [string]: EntityMetadata } = {}
+  local _hierarchyColumns: ColumnMetadata[]? = nil
+  local _tableMetadata: EntityMetadata? = nil
+
+  constructor(entityClass: any, className: string, tableName: string, columns: ColumnMetadata[], relations: RelationMetadata[], indexes: IndexMetadata[], isMappedSuperclass: boolean, parent: EntityMetadata?, embeddeds: EmbeddedMetadata[] = {})
+    self.entityClass = entityClass
+    self.className = className
+    self.tableName = tableName
+    self.columns = columns
+    self.relations = relations
+    self.indexes = indexes
+    self.embeddeds = embeddeds
+    self.isMappedSuperclass = isMappedSuperclass
+    self.parent = parent
+    for _, column in ipairs(columns) do
+      table.insert(self._tableColumns, column)
+    end
+
+    for _, embedded in ipairs(embeddeds) do
+      self._embeddedsByField[embedded.fieldName] = embedded
+      for _, column in ipairs(embedded.columns) do
+        table.insert(self._tableColumns, column)
+        self._columnsByName[column.columnName] = column
+      end
+    end
+
+    for index = 1, #relations do
+      relations[index].owner = self
+      self._relationsByField[relations[index].fieldName] = relations[index]
+    end
+
+    for index = 1, #columns do
+      local column = columns[index]
+      self._columnsByField[column.fieldName] = column
+      self._columnsByName[column.columnName] = column
+      if column.isId then
+        self.idColumn = column
+      end
+
+      if column.isSoftDelete then
+        self.softDeleteColumn = column
+      end
+
+      if column.isVersion then
+        self.versionColumn = column
+      end
+    end
+  end
+
+  --- Returns the columns of the table: the columns of the entity followed by the columns of its embedded fields. Foreign keys are not included.
+  function getTableColumns(): ColumnMetadata[]
+    return self._tableColumns
+  end
+
+  --- Makes this entity the root of a single table inheritance hierarchy with the given discriminator column.
+  function enableSingleTableInheritance(column: ColumnMetadata, value: string?): void
+    self.inheritanceRoot = self
+    self.discriminatorValue = value
+    self:useDiscriminatorColumn(column)
+    if value ~= nil then
+      self._discriminatorMap[value] = self
+    end
+  end
+
+  --- Adds a subclass to the single table inheritance hierarchy of this root. Raises an error for a discriminator value used twice.
+  function addSubclass(subclass: EntityMetadata): void
+    local column = self.discriminatorColumn
+    if column == nil then
+      error("'" .. self.className .. "' is no root of a single table inheritance", 2)
+    end
+
+    local value = subclass.discriminatorValue
+    if value ~= nil then
+      local known = self._discriminatorMap[value]
+      if known ~= nil and known.className ~= subclass.className then
+        error("The discriminator value '" .. value .. "' is used by '" .. known.className .. "' and '" .. subclass.className .. "'", 3)
+      end
+
+      self._discriminatorMap[value] = subclass
+    end
+
+    for index, member in ipairs(self._members) do
+      if member.className == subclass.className then
+        table.remove(self._members, index)
+        break
+      end
+    end
+
+    subclass.inheritanceRoot = self
+    subclass:useDiscriminatorColumn(column)
+    table.insert(self._members, subclass)
+    self._hierarchyColumns = nil
+    self._tableMetadata = nil
+  end
+
+  --- Returns the root of the inheritance hierarchy, or this entity if it is not part of one.
+  function getRootMetadata(): EntityMetadata
+    return self.inheritanceRoot ?? self
+  end
+
+  --- Returns whether the entity is part of a single table inheritance hierarchy.
+  function isInheritanceMember(): boolean
+    return self.inheritanceRoot ~= nil
+  end
+
+  --- Returns the class of the hierarchy with the given discriminator value.
+  function getSubclassByDiscriminator(value: string): EntityMetadata?
+    return self:getRootMetadata()._discriminatorMap[value]
+  end
+
+  --- Returns the discriminator values of this class and all classes extending it, which are the rows a query of this class matches.
+  function getDiscriminatorValues(): string[]
+    local result: string[] = {}
+    local root = self:getRootMetadata()
+    for value, member in pairs(root._discriminatorMap) do
+      if member:extendsOrIs(self) then
+        table.insert(result, value as string)
+      end
+    end
+
+    table.sort(result)
+    return result
+  end
+
+  --- Returns whether this entity is the given one or extends it.
+  function extendsOrIs(other: EntityMetadata): boolean
+    local current: EntityMetadata? = self
+    while current ~= nil do
+      if current == other then
+        return true
+      end
+
+      current = current.parent
+    end
+
+    return false
+  end
+
+  --- Returns the columns and foreign key columns of all classes of the inheritance hierarchy, which queries select to read any of them.
+  function getHierarchyColumns(): ColumnMetadata[]
+    local root = self:getRootMetadata()
+    local cached = root._hierarchyColumns
+    if cached ~= nil then
+      return cached
+    end
+
+    local result: ColumnMetadata[] = {}
+    local known: { [string]: boolean } = {}
+    local members: EntityMetadata[] = { root }
+    for _, member in ipairs(root._members) do
+      table.insert(members, member)
+    end
+
+    for _, member in ipairs(members) do
+      for _, column in ipairs(member:getTableColumns()) do
+        if not known[column.columnName] then
+          known[column.columnName] = true
+          table.insert(result, column)
+        end
+      end
+
+      for _, column in ipairs(member:getJoinColumns()) do
+        if not known[column.columnName] then
+          known[column.columnName] = true
+          table.insert(result, column)
+        end
+      end
+    end
+
+    root._hierarchyColumns = result
+    return result
+  end
+
+  --- Returns the metadata describing the table of the entity. For an inheritance hierarchy it combines the columns, relations, embedded
+  --- fields and indexes of all of its classes, with the columns of the subclasses being nullable.
+  function getTableMetadata(): EntityMetadata
+    local root = self:getRootMetadata()
+    if root.discriminatorColumn == nil or #root._members == 0 then
+      return root
+    end
+
+    local cached = root._tableMetadata
+    if cached ~= nil then
+      return cached
+    end
+
+    local columns: ColumnMetadata[] = {}
+    local relations: RelationMetadata[] = {}
+    local embeddeds: EmbeddedMetadata[] = {}
+    local indexes: IndexMetadata[] = {}
+    local knownColumns: { [string]: boolean } = {}
+    local knownRelations: { [string]: boolean } = {}
+    local knownEmbeddeds: { [string]: boolean } = {}
+    local knownIndexes: { [any]: boolean } = {}
+    local members: EntityMetadata[] = { root }
+    for _, member in ipairs(root._members) do
+      table.insert(members, member)
+    end
+
+    for _, member in ipairs(members) do
+      local isRoot = member == root
+      for _, column in ipairs(member.columns) do
+        if not knownColumns[column.columnName] then
+          knownColumns[column.columnName] = true
+          if isRoot then
+            table.insert(columns, column)
+          else
+            local copy = column:copy(column.fieldName, column.columnName)
+            copy.nullable = true
+            table.insert(columns, copy)
+          end
+        end
+      end
+
+      for _, relation in ipairs(member.relations) do
+        if not knownRelations[relation.fieldName] then
+          knownRelations[relation.fieldName] = true
+          local copy = relation:copy()
+          if not isRoot then
+            copy.nullable = true
+          end
+
+          table.insert(relations, copy)
+        end
+      end
+
+      for _, embedded in ipairs(member.embeddeds) do
+        if not knownEmbeddeds[embedded.fieldName] then
+          knownEmbeddeds[embedded.fieldName] = true
+          table.insert(embeddeds, isRoot and embedded or new EmbeddedMetadata(embedded.fieldName, embedded.embeddable, embedded.prefix, true))
+        end
+      end
+
+      for _, index in ipairs(member.indexes) do
+        if not knownIndexes[index] then
+          knownIndexes[index] = true
+          table.insert(indexes, index)
+        end
+      end
+    end
+
+    local combined = new EntityMetadata(root.entityClass, root.className, root.tableName, columns, relations, indexes, false, nil, embeddeds)
+    combined.packageName = root.packageName
+    combined:useDiscriminatorColumn(root.discriminatorColumn as ColumnMetadata)
+    root._tableMetadata = combined
+    return combined
+  end
+
+  local function useDiscriminatorColumn(column: ColumnMetadata): void
+    self.discriminatorColumn = column
+    for _, existing in ipairs(self._tableColumns) do
+      if existing == column then
+        return
+      end
+    end
+
+    table.insert(self._tableColumns, column)
+    self._columnsByName[column.columnName] = column
+  end
+
+  --- Returns the embedded field with the given name.
+  function getEmbedded(fieldName: string): EmbeddedMetadata?
+    return self._embeddedsByField[fieldName]
+  end
+
+  --- Returns the column mapped to the given field.
+  function getColumn(fieldName: string): ColumnMetadata?
+    return self._columnsByField[fieldName]
+  end
+
+  --- Returns the column with the given database name.
+  function getColumnByName(columnName: string): ColumnMetadata?
+    return self._columnsByName[columnName]
+  end
+
+  --- Returns whether the given field is mapped to a column.
+  function hasColumn(fieldName: any): boolean
+    return fieldName is string and self._columnsByField[fieldName] ~= nil
+  end
+
+  --- Returns the relation of the given field.
+  function getRelation(fieldName: string): RelationMetadata?
+    return self._relationsByField[fieldName]
+  end
+
+  --- Returns whether the given field is a column or a relation, which the change tracking covers.
+  function isTracked(fieldName: any): boolean
+    return fieldName is string and (self._columnsByField[fieldName] ~= nil or self._relationsByField[fieldName] ~= nil or self._embeddedsByField[fieldName] ~= nil)
+  end
+
+  --- Returns whether a change of the given field is written to the table, which is the case for columns, embedded fields and owning to-one relations.
+  function isWritable(fieldName: string): boolean
+    if self._columnsByField[fieldName] ~= nil or self._embeddedsByField[fieldName] ~= nil then
+      return true
+    end
+
+    local relation = self._relationsByField[fieldName]
+    return relation ~= nil and relation:hasJoinColumn()
+  end
+
+  --- Returns the foreign key columns of all owning to-one relations.
+  function getJoinColumns(): ColumnMetadata[]
+    local result: ColumnMetadata[] = {}
+    for index = 1, #self.relations do
+      if self.relations[index]:hasJoinColumn() then
+        table.insert(result, self.relations[index]:getJoinColumn())
+      end
+    end
+
+    return result
+  end
+
+  --- Returns the column or the foreign key column of an owning to-one relation for the given field. Columns of embedded fields are
+  --- found by their path, like "address.city".
+  function getColumnOrJoinColumn(fieldName: string): ColumnMetadata?
+    local column = self._columnsByField[fieldName]
+    if column ~= nil then
+      return column
+    end
+
+    local head, rest = string.match(fieldName, "^([^%.]+)%.(.+)$")
+    if head ~= nil and rest ~= nil then
+      local embedded = self._embeddedsByField[head]
+      if embedded ~= nil then
+        for _, embeddedColumn in ipairs(embedded.columns) do
+          if embeddedColumn.property == rest then
+            return embeddedColumn
+          end
+        end
+      end
+    end
+
+    local relation = self._relationsByField[fieldName]
+    if relation ~= nil and relation:hasJoinColumn() then
+      return relation:getJoinColumn()
+    end
+
+    return nil
+  end
+
+  --- Returns the id column. Raises an error for mapped superclasses or entities without id.
+  function getIdColumn(): ColumnMetadata
+    local idColumn = self.idColumn
+    if idColumn == nil then
+      error("Entity '" .. self.className .. "' has no id column", 2)
+    end
+
+    return idColumn
+  end
+end

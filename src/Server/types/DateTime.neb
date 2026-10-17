@@ -1,0 +1,1211 @@
+import { Calendar, DayOfWeek, TimeUnit } from "./Calendar"
+import { TimeZone } from "./TimeZone"
+import { Duration } from "./Duration"
+
+local MS_PER_SECOND = 1000
+local MS_PER_MINUTE = 60000
+local MS_PER_HOUR = 3600000
+local MS_PER_DAY = 86400000
+local MS_PER_WEEK = 604800000
+
+local PATTERN_LETTERS = "yMdDEuHhmsSaXxZzV"
+local TIME_LETTERS = "HhmsSa"
+local NUMERIC_LETTERS = "yDdHhmsSu"
+local ISO_FORMAT: DateFormat? = nil
+
+local function truncate(value: number): number
+  if value >= 0 then
+    return math.floor(value)
+  end
+
+  return math.ceil(value)
+end
+
+local function pad(value: number, width: number): string
+  if value < 0 then
+    return "-" .. string.format("%0" .. width .. "d", -value)
+  end
+
+  return string.format("%0" .. width .. "d", value)
+end
+
+local function containsLetter(letters: string, letter: string): boolean
+  return string.find(letters, letter, 1, true) ~= nil
+end
+
+--- An interface to define how to format a DateTime object.
+export interface DateFormat
+
+  --- Converts the given DateTime object into a string based on the format.
+  method toString(dt: DateTime): string
+
+  --- Converts the given string into a DateTime object based on the format. If it fails, nil will be returned.
+  method fromString(str: string): DateTime?
+
+end
+
+--- An immutable point in time with a time zone, or a calendar date without any time when created as date only.
+--- Every manipulation returns a new DateTime object.
+export class DateTime
+
+  --- The format used by toString and parse when no format is given.
+  static defaultFormat: DateFormat? = nil
+
+  local _epoch: number = 0
+  local _zone: TimeZone = TimeZone.UTC
+  local _dateOnly: boolean = false
+  local _offset: number = 0
+  local _year: number = 1970
+  local _month: number = 1
+  local _day: number = 1
+  local _hour: number = 0
+  local _minute: number = 0
+  local _second: number = 0
+  local _millisecond: number = 0
+
+  --- Creates a DateTime from UTC epoch milliseconds in the given time zone. Without an epoch the current time is used and without a zone the default zone.
+  --- If dateOnly is true, only the calendar date at that instant in the given zone is kept.
+  constructor(epoch: number? = nil, zone: TimeZone? = nil, dateOnly: boolean = false)
+    local value = math.floor(epoch ?? Server.GetTime())
+    local resolvedZone = zone ?? TimeZone.getDefault()
+    if dateOnly then
+      local days = (value + resolvedZone:getOffset(value) * MS_PER_MINUTE) // MS_PER_DAY
+      self._epoch = days * MS_PER_DAY
+      self._zone = TimeZone.UTC
+    else
+      self._epoch = value
+      self._zone = resolvedZone
+    end
+
+    self._dateOnly = dateOnly
+    self:compute()
+  end
+
+  local function compute(): void
+    if self._dateOnly then
+      self._offset = 0
+    else
+      self._offset = self._zone:getOffset(self._epoch)
+    end
+
+    local localMs = self._epoch + self._offset * MS_PER_MINUTE
+    local days = localMs // MS_PER_DAY
+    local timeOfDay = localMs - days * MS_PER_DAY
+    self._year, self._month, self._day = Calendar.civilFromDays(days)
+    self._hour = timeOfDay // MS_PER_HOUR
+    self._minute = timeOfDay % MS_PER_HOUR // MS_PER_MINUTE
+    self._second = timeOfDay % MS_PER_MINUTE // MS_PER_SECOND
+    self._millisecond = timeOfDay % MS_PER_SECOND
+  end
+
+  local function requireTime(operation: string): void
+    if self._dateOnly then
+      error("Cannot use '" .. operation .. "' on a date only DateTime, use atTime or toDateTime first", 3)
+    end
+  end
+
+  local function rebuild(year: number, month: number, day: number, hour: number, minute: number, second: number, millisecond: number): DateTime
+    if self._dateOnly then
+      return new DateTime(Calendar.daysFromCivil(year, month, day) * MS_PER_DAY, TimeZone.UTC, true)
+    end
+
+    local localMs = Calendar.daysFromCivil(year, month, day) * MS_PER_DAY
+      + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * MS_PER_SECOND + millisecond
+    return new DateTime(self._zone:toUtcEpoch(localMs), self._zone)
+  end
+
+  --- Returns the current date and time in the given zone, or in the default zone.
+  static function now(zone: TimeZone? = nil): DateTime
+    return new DateTime(nil, zone)
+  end
+
+  --- Returns the current date without a time, based on the given zone or the default zone.
+  static function today(zone: TimeZone? = nil): DateTime
+    return new DateTime(nil, zone, true)
+  end
+
+  --- Creates a DateTime from its components in the given zone, or in the default zone. Raises an error for invalid components.
+  static function of(year: number, month: number, day: number, hour: number = 0, minute: number = 0, second: number = 0, millisecond: number = 0, zone: TimeZone? = nil): DateTime
+    if not Calendar.isValidDate(year, month, day) then
+      error("Invalid date: " .. year .. "-" .. month .. "-" .. day, 2)
+    end
+
+    if not Calendar.isValidTime(hour, minute, second, millisecond) then
+      error("Invalid time: " .. hour .. ":" .. minute .. ":" .. second .. "." .. millisecond, 2)
+    end
+
+    local resolvedZone = zone ?? TimeZone.getDefault()
+    local localMs = Calendar.daysFromCivil(year, month, day) * MS_PER_DAY
+      + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * MS_PER_SECOND + millisecond
+    return new DateTime(resolvedZone:toUtcEpoch(localMs), resolvedZone)
+  end
+
+  --- Creates a date only DateTime without a time and without a time zone. Raises an error for an invalid date.
+  static function date(year: number, month: number, day: number): DateTime
+    if not Calendar.isValidDate(year, month, day) then
+      error("Invalid date: " .. year .. "-" .. month .. "-" .. day, 2)
+    end
+
+    return new DateTime(Calendar.daysFromCivil(year, month, day) * MS_PER_DAY, TimeZone.UTC, true)
+  end
+
+  --- Creates a DateTime from UTC epoch milliseconds.
+  static function fromEpoch(epoch: number, zone: TimeZone? = nil): DateTime
+    return new DateTime(epoch, zone)
+  end
+
+  --- Creates a DateTime from UTC epoch seconds.
+  static function fromEpochSeconds(epochSeconds: number, zone: TimeZone? = nil): DateTime
+    return new DateTime(epochSeconds * MS_PER_SECOND, zone)
+  end
+
+  --- Parses the given string with the given format, or with the default format. Returns nil if the string does not match.
+  static function parse(str: string, format: DateFormat? = nil): DateTime?
+    local resolvedFormat = format ?? DateTime.defaultFormat
+    if resolvedFormat == nil then
+      error("No DateFormat given and DateTime.defaultFormat is not set", 2)
+    end
+
+    return resolvedFormat:fromString(str)
+  end
+
+  --- Returns the earliest of the given DateTime objects.
+  static function min(first: DateTime, ...others: DateTime): DateTime
+    local result = first
+    for _, other in ipairs({ ... }) do
+      local candidate = other as DateTime
+      if candidate:getEpoch() < result:getEpoch() then
+        result = candidate
+      end
+    end
+
+    return result
+  end
+
+  --- Returns the latest of the given DateTime objects.
+  static function max(first: DateTime, ...others: DateTime): DateTime
+    local result = first
+    for _, other in ipairs({ ... }) do
+      local candidate = other as DateTime
+      if candidate:getEpoch() > result:getEpoch() then
+        result = candidate
+      end
+    end
+
+    return result
+  end
+
+  --- Returns the UTC epoch in milliseconds. For date only values this is midnight UTC of the date.
+  function getEpoch(): number
+    return self._epoch
+  end
+
+  --- Returns the UTC epoch in whole seconds.
+  function getEpochSeconds(): number
+    return self._epoch // MS_PER_SECOND
+  end
+
+  --- Returns the time zone. Date only values always report UTC.
+  function getZone(): TimeZone
+    return self._zone
+  end
+
+  --- Returns the offset to UTC in minutes at this instant.
+  function getOffset(): number
+    return self._offset
+  end
+
+  --- Returns the abbreviation of the time zone at this instant, for example "CEST".
+  function getZoneName(): string
+    return self._zone:getName(self._epoch)
+  end
+
+  --- Returns whether this DateTime only represents a calendar date without a time.
+  function isDateOnly(): boolean
+    return self._dateOnly
+  end
+
+  --- Returns whether daylight saving time is active at this instant.
+  function isDaylightSaving(): boolean
+    return not self._dateOnly and self._zone:isDaylightSaving(self._epoch)
+  end
+
+  --- Returns the year.
+  function getYear(): number
+    return self._year
+  end
+
+  --- Returns the month from 1 to 12.
+  function getMonth(): number
+    return self._month
+  end
+
+  --- Returns the day of the month from 1 to 31.
+  function getDay(): number
+    return self._day
+  end
+
+  --- Returns the hour from 0 to 23.
+  function getHour(): number
+    return self._hour
+  end
+
+  --- Returns the minute from 0 to 59.
+  function getMinute(): number
+    return self._minute
+  end
+
+  --- Returns the second from 0 to 59.
+  function getSecond(): number
+    return self._second
+  end
+
+  --- Returns the millisecond from 0 to 999.
+  function getMillisecond(): number
+    return self._millisecond
+  end
+
+  --- Returns the day of the week.
+  function getDayOfWeek(): DayOfWeek
+    return Calendar.weekdayFromDays(Calendar.daysFromCivil(self._year, self._month, self._day)) as DayOfWeek
+  end
+
+  --- Returns the day of the year from 1 to 366.
+  function getDayOfYear(): number
+    return Calendar.daysFromCivil(self._year, self._month, self._day) - Calendar.daysFromCivil(self._year, 1, 1) + 1
+  end
+
+  --- Returns the ISO 8601 week of the year from 1 to 53.
+  function getWeekOfYear(): number
+    local week = (self:getDayOfYear() - (self:getDayOfWeek() as number) + 10) // 7
+    if week < 1 then
+      return Calendar.weeksInYear(self._year - 1)
+    elseif week > Calendar.weeksInYear(self._year) then
+      return 1
+    end
+
+    return week
+  end
+
+  --- Returns the amount of days in the month of this date.
+  function getDaysInMonth(): number
+    return Calendar.daysInMonth(self._year, self._month)
+  end
+
+  --- Returns whether the year of this date is a leap year.
+  function isLeapYear(): boolean
+    return Calendar.isLeapYear(self._year)
+  end
+
+  --- Returns the wall clock time in milliseconds since the epoch, ignoring the time zone.
+  function getLocalEpoch(): number
+    return self._epoch + self._offset * MS_PER_MINUTE
+  end
+
+  --- Adds the given amount of the given unit. Days, weeks, months and years keep the wall clock time across daylight saving changes.
+  function add(amount: number, unit: TimeUnit): DateTime
+    if unit == TimeUnit.Year then
+      return self:addYears(amount)
+    elseif unit == TimeUnit.Month then
+      return self:addMonths(amount)
+    elseif unit == TimeUnit.Week then
+      return self:addWeeks(amount)
+    elseif unit == TimeUnit.Day then
+      return self:addDays(amount)
+    elseif unit == TimeUnit.Hour then
+      return self:addHours(amount)
+    elseif unit == TimeUnit.Minute then
+      return self:addMinutes(amount)
+    elseif unit == TimeUnit.Second then
+      return self:addSeconds(amount)
+    end
+
+    return self:addMilliseconds(amount)
+  end
+
+  --- Subtracts the given amount of the given unit.
+  function subtract(amount: number, unit: TimeUnit): DateTime
+    return self:add(-amount, unit)
+  end
+
+  --- Adds years. The day is clamped to the end of the month, so February 29 becomes February 28 in non leap years.
+  function addYears(years: number): DateTime
+    return self:addMonths(years * 12)
+  end
+
+  --- Adds months. The day is clamped to the end of the target month.
+  function addMonths(months: number): DateTime
+    local total = self._year * 12 + (self._month - 1) + math.floor(months)
+    local year = total // 12
+    local month = total % 12 + 1
+    local day = math.min(self._day, Calendar.daysInMonth(year, month))
+    return self:rebuild(year, month, day, self._hour, self._minute, self._second, self._millisecond)
+  end
+
+  --- Adds weeks.
+  function addWeeks(weeks: number): DateTime
+    return self:addDays(weeks * 7)
+  end
+
+  --- Adds calendar days while keeping the wall clock time.
+  function addDays(days: number): DateTime
+    return self:rebuild(self._year, self._month, self._day + math.floor(days), self._hour, self._minute, self._second, self._millisecond)
+  end
+
+  --- Adds an exact amount of hours.
+  function addHours(hours: number): DateTime
+    self:requireTime("addHours")
+    return new DateTime(self._epoch + math.floor(hours * MS_PER_HOUR), self._zone)
+  end
+
+  --- Adds an exact amount of minutes.
+  function addMinutes(minutes: number): DateTime
+    self:requireTime("addMinutes")
+    return new DateTime(self._epoch + math.floor(minutes * MS_PER_MINUTE), self._zone)
+  end
+
+  --- Adds an exact amount of seconds.
+  function addSeconds(seconds: number): DateTime
+    self:requireTime("addSeconds")
+    return new DateTime(self._epoch + math.floor(seconds * MS_PER_SECOND), self._zone)
+  end
+
+  --- Adds an exact amount of milliseconds.
+  function addMilliseconds(milliseconds: number): DateTime
+    self:requireTime("addMilliseconds")
+    return new DateTime(self._epoch + math.floor(milliseconds), self._zone)
+  end
+
+  --- Adds the given duration as an exact amount of time. Date only values only accept whole days.
+  function plus(duration: Duration): DateTime
+    if self._dateOnly then
+      local milliseconds = duration:toMilliseconds()
+      if milliseconds % MS_PER_DAY ~= 0 then
+        error("Cannot add a Duration with a time part to a date only DateTime", 2)
+      end
+
+      return self:addDays(milliseconds // MS_PER_DAY)
+    end
+
+    return self:addMilliseconds(duration:toMilliseconds())
+  end
+
+  --- Subtracts the given duration as an exact amount of time. Date only values only accept whole days.
+  function minus(duration: Duration): DateTime
+    return self:plus(duration:negate())
+  end
+
+  --- Returns the exact duration from this DateTime to the other one. Positive if the other one is later.
+  function durationTo(other: DateTime): Duration
+    return new Duration(other:getEpoch() - self._epoch)
+  end
+
+  --- Returns a copy with the given year. The day is clamped to the end of the month.
+  function withYear(year: number): DateTime
+    local day = math.min(self._day, Calendar.daysInMonth(year, self._month))
+    return self:withDate(year, self._month, day)
+  end
+
+  --- Returns a copy with the given month. The day is clamped to the end of the month.
+  function withMonth(month: number): DateTime
+    if month < 1 or month > 12 then
+      error("Invalid month: " .. month, 2)
+    end
+
+    local day = math.min(self._day, Calendar.daysInMonth(self._year, month))
+    return self:withDate(self._year, month, day)
+  end
+
+  --- Returns a copy with the given day of the month.
+  function withDay(day: number): DateTime
+    return self:withDate(self._year, self._month, day)
+  end
+
+  --- Returns a copy with the given date and the same time.
+  function withDate(year: number, month: number, day: number): DateTime
+    if not Calendar.isValidDate(year, month, day) then
+      error("Invalid date: " .. year .. "-" .. month .. "-" .. day, 2)
+    end
+
+    return self:rebuild(year, month, day, self._hour, self._minute, self._second, self._millisecond)
+  end
+
+  --- Returns a copy with the given hour.
+  function withHour(hour: number): DateTime
+    return self:withTime(hour, self._minute, self._second, self._millisecond)
+  end
+
+  --- Returns a copy with the given minute.
+  function withMinute(minute: number): DateTime
+    return self:withTime(self._hour, minute, self._second, self._millisecond)
+  end
+
+  --- Returns a copy with the given second.
+  function withSecond(second: number): DateTime
+    return self:withTime(self._hour, self._minute, second, self._millisecond)
+  end
+
+  --- Returns a copy with the given millisecond.
+  function withMillisecond(millisecond: number): DateTime
+    return self:withTime(self._hour, self._minute, self._second, millisecond)
+  end
+
+  --- Returns a copy with the given time and the same date.
+  function withTime(hour: number, minute: number = 0, second: number = 0, millisecond: number = 0): DateTime
+    self:requireTime("withTime")
+    if not Calendar.isValidTime(hour, minute, second, millisecond) then
+      error("Invalid time: " .. hour .. ":" .. minute .. ":" .. second .. "." .. millisecond, 2)
+    end
+
+    return self:rebuild(self._year, self._month, self._day, hour, minute, second, millisecond)
+  end
+
+  --- Returns the same instant in another time zone. Date only values are returned unchanged.
+  function withZone(zone: TimeZone): DateTime
+    if self._dateOnly then
+      return self
+    end
+
+    return new DateTime(self._epoch, zone)
+  end
+
+  --- Returns the same wall clock time in another time zone, which results in a different instant.
+  function withZoneSameLocal(zone: TimeZone): DateTime
+    if self._dateOnly then
+      return self
+    end
+
+    return DateTime.of(self._year, self._month, self._day, self._hour, self._minute, self._second, self._millisecond, zone)
+  end
+
+  --- Returns the same instant in UTC.
+  function toUtc(): DateTime
+    return self:withZone(TimeZone.UTC)
+  end
+
+  --- Returns the calendar date of this DateTime without the time.
+  function toDate(): DateTime
+    if self._dateOnly then
+      return self
+    end
+
+    return DateTime.date(self._year, self._month, self._day)
+  end
+
+  --- Returns a full DateTime. Date only values become midnight in the given zone, or in the default zone.
+  function toDateTime(zone: TimeZone? = nil): DateTime
+    if not self._dateOnly then
+      return self
+    end
+
+    return DateTime.of(self._year, self._month, self._day, 0, 0, 0, 0, zone)
+  end
+
+  --- Combines the date of this DateTime with the given time. The zone defaults to the zone of this DateTime, or the default zone for date only values.
+  function atTime(hour: number, minute: number = 0, second: number = 0, millisecond: number = 0, zone: TimeZone? = nil): DateTime
+    local resolvedZone = zone ?? (self._dateOnly and TimeZone.getDefault() or self._zone)
+    return DateTime.of(self._year, self._month, self._day, hour, minute, second, millisecond, resolvedZone)
+  end
+
+  --- Returns the start of the given unit, for example midnight for TimeUnit.Day or Monday midnight for TimeUnit.Week.
+  function startOf(unit: TimeUnit): DateTime
+    if unit == TimeUnit.Year then
+      return self:rebuild(self._year, 1, 1, 0, 0, 0, 0)
+    elseif unit == TimeUnit.Month then
+      return self:rebuild(self._year, self._month, 1, 0, 0, 0, 0)
+    elseif unit == TimeUnit.Week then
+      return self:rebuild(self._year, self._month, self._day - (self:getDayOfWeek() as number) + 1, 0, 0, 0, 0)
+    elseif unit == TimeUnit.Day then
+      return self:rebuild(self._year, self._month, self._day, 0, 0, 0, 0)
+    elseif unit == TimeUnit.Hour then
+      return self:rebuild(self._year, self._month, self._day, self._hour, 0, 0, 0)
+    elseif unit == TimeUnit.Minute then
+      return self:rebuild(self._year, self._month, self._day, self._hour, self._minute, 0, 0)
+    elseif unit == TimeUnit.Second then
+      return self:rebuild(self._year, self._month, self._day, self._hour, self._minute, self._second, 0)
+    end
+
+    return self
+  end
+
+  --- Returns the last millisecond of the given unit. For date only values it returns the last day of the unit.
+  function endOf(unit: TimeUnit): DateTime
+    if self._dateOnly then
+      if (unit as number) <= (TimeUnit.Day as number) then
+        return self
+      end
+
+      return self:startOf(unit):add(1, unit):addDays(-1)
+    end
+
+    if unit == TimeUnit.Millisecond then
+      return self
+    end
+
+    return self:startOf(unit):add(1, unit):addMilliseconds(-1)
+  end
+
+  --- Returns the start of the day.
+  function startOfDay(): DateTime
+    return self:startOf(TimeUnit.Day)
+  end
+
+  --- Returns the last millisecond of the day.
+  function endOfDay(): DateTime
+    return self:endOf(TimeUnit.Day)
+  end
+
+  --- Returns the difference between this and the other DateTime in whole units, truncated towards zero. Positive if this is after the other.
+  function diff(other: DateTime, unit: TimeUnit = TimeUnit.Millisecond): number
+    if unit == TimeUnit.Year or unit == TimeUnit.Month then
+      local compared = other:withZone(self._zone)
+      local months = (self._year - compared:getYear()) * 12 + (self._month - compared:getMonth())
+      local anchor = compared:addMonths(months):getEpoch()
+      if months > 0 and anchor > self._epoch then
+        months = months - 1
+      elseif months < 0 and anchor < self._epoch then
+        months = months + 1
+      end
+
+      if unit == TimeUnit.Year then
+        return truncate(months / 12)
+      end
+
+      return months
+    elseif unit == TimeUnit.Week then
+      return truncate((self:getLocalEpoch() - other:getLocalEpoch()) / MS_PER_WEEK)
+    elseif unit == TimeUnit.Day then
+      return truncate((self:getLocalEpoch() - other:getLocalEpoch()) / MS_PER_DAY)
+    elseif unit == TimeUnit.Hour then
+      return truncate((self._epoch - other:getEpoch()) / MS_PER_HOUR)
+    elseif unit == TimeUnit.Minute then
+      return truncate((self._epoch - other:getEpoch()) / MS_PER_MINUTE)
+    elseif unit == TimeUnit.Second then
+      return truncate((self._epoch - other:getEpoch()) / MS_PER_SECOND)
+    end
+
+    return self._epoch - other:getEpoch()
+  end
+
+  --- Returns -1 if this is before the other DateTime, 1 if it is after and 0 if both are the same instant.
+  function compareTo(other: DateTime): number
+    if self._epoch < other:getEpoch() then
+      return -1
+    elseif self._epoch > other:getEpoch() then
+      return 1
+    end
+
+    return 0
+  end
+
+  --- Returns whether this is before the other DateTime.
+  function isBefore(other: DateTime): boolean
+    return self._epoch < other:getEpoch()
+  end
+
+  --- Returns whether this is after the other DateTime.
+  function isAfter(other: DateTime): boolean
+    return self._epoch > other:getEpoch()
+  end
+
+  --- Returns whether this lies between the two given DateTime objects.
+  function isBetween(first: DateTime, last: DateTime, inclusive: boolean = true): boolean
+    if inclusive then
+      return self._epoch >= first:getEpoch() and self._epoch <= last:getEpoch()
+    end
+
+    return self._epoch > first:getEpoch() and self._epoch < last:getEpoch()
+  end
+
+  --- Returns whether both represent the same instant and are both either date only or not.
+  function equals(other: DateTime): boolean
+    return self._epoch == other:getEpoch() and self._dateOnly == other:isDateOnly()
+  end
+
+  --- Returns whether both fall into the same unit, for example the same day, compared in the zone of this DateTime.
+  function isSame(other: DateTime, unit: TimeUnit): boolean
+    local compared = other:withZone(self._zone)
+    return self:startOf(unit):getEpoch() == compared:startOf(unit):getEpoch()
+  end
+
+  --- Returns whether this DateTime is in the past.
+  function isPast(): boolean
+    if self._dateOnly then
+      return self:isBefore(DateTime.today())
+    end
+
+    return self._epoch < Server.GetTime()
+  end
+
+  --- Returns whether this DateTime is in the future.
+  function isFuture(): boolean
+    if self._dateOnly then
+      return self:isAfter(DateTime.today())
+    end
+
+    return self._epoch > Server.GetTime()
+  end
+
+  --- Returns whether this DateTime is on the current day.
+  function isToday(): boolean
+    return self:toDate():equals(DateTime.today(self._dateOnly and nil or self._zone))
+  end
+
+  --- Formats this DateTime with the given format, or with the default format.
+  function toString(format: DateFormat? = nil): string
+    local resolvedFormat = format ?? DateTime.defaultFormat
+    if resolvedFormat == nil then
+      error("No DateFormat given and DateTime.defaultFormat is not set", 2)
+    end
+
+    return resolvedFormat:toString(self)
+  end
+
+  --- Formats this DateTime as ISO 8601, for example "2026-10-16T14:30:00.000+02:00" or "2026-10-16" for date only values.
+  function toISOString(): string
+    local format = ISO_FORMAT
+    if format == nil then
+      error("ISO format is not initialized", 2)
+    end
+
+    return format:toString(self)
+  end
+
+  function __tostring(): string
+    return self:toString()
+  end
+
+  operator ==(other: DateTime): boolean
+    return self._epoch == other:getEpoch() and self._dateOnly == other:isDateOnly()
+  end
+
+  operator <(other: DateTime): boolean
+    return self._epoch < other:getEpoch()
+  end
+
+  operator <=(other: DateTime): boolean
+    return self._epoch <= other:getEpoch()
+  end
+end
+
+--- The localized names used by StringDateFormat.
+export class DateLocale
+
+  --- English month and day names.
+  static ENGLISH: DateLocale = new DateLocale(
+    { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" },
+    { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" },
+    { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" },
+    { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" },
+    "AM",
+    "PM"
+  )
+
+  --- German month and day names.
+  static GERMAN: DateLocale = new DateLocale(
+    { "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember" },
+    { "Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez" },
+    { "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag" },
+    { "Mo", "Di", "Mi", "Do", "Fr", "Sa", "So" },
+    "AM",
+    "PM"
+  )
+
+  --- The full month names from January to December.
+  monthNames: string[]
+
+  --- The short month names from January to December.
+  monthShortNames: string[]
+
+  --- The full day names from Monday to Sunday.
+  dayNames: string[]
+
+  --- The short day names from Monday to Sunday.
+  dayShortNames: string[]
+
+  --- The marker for hours before noon.
+  am: string
+
+  --- The marker for hours after noon.
+  pm: string
+
+  constructor(monthNames: string[], monthShortNames: string[], dayNames: string[], dayShortNames: string[], am: string, pm: string)
+    self.monthNames = monthNames
+    self.monthShortNames = monthShortNames
+    self.dayNames = dayNames
+    self.dayShortNames = dayShortNames
+    self.am = am
+    self.pm = pm
+  end
+end
+
+class PatternToken
+  letter: string
+  width: number
+  text: string
+
+  constructor(letter: string, width: number, text: string)
+    self.letter = letter
+    self.width = width
+    self.text = text
+  end
+
+  function isNumeric(): boolean
+    return containsLetter(NUMERIC_LETTERS, self.letter) or (self.letter == "M" and self.width <= 2)
+  end
+end
+
+local function tokenizePattern(pattern: string): PatternToken[]
+  local tokens: PatternToken[] = {}
+  local literal = ""
+  local index = 1
+  local length = #pattern
+  while index <= length do
+    local char = string.sub(pattern, index, index)
+    if char == "'" then
+      if string.sub(pattern, index + 1, index + 1) == "'" then
+        literal = literal .. "'"
+        index = index + 2
+      else
+        local closing, _ = string.find(pattern, "'", index + 1, true)
+        if closing == nil then
+          error("Unterminated quote in date pattern: " .. pattern, 3)
+        end
+
+        literal = literal .. string.sub(pattern, index + 1, closing - 1)
+        index = closing + 1
+      end
+    elseif string.find(char, "%a") ~= nil then
+      if not containsLetter(PATTERN_LETTERS, char) then
+        error("Unknown letter '" .. char .. "' in date pattern: " .. pattern, 3)
+      end
+
+      if literal ~= "" then
+        table.insert(tokens, new PatternToken("", 0, literal))
+        literal = ""
+      end
+
+      local last = index
+      while string.sub(pattern, last + 1, last + 1) == char do
+        last = last + 1
+      end
+
+      table.insert(tokens, new PatternToken(char, last - index + 1, ""))
+      index = last + 1
+    else
+      literal = literal .. char
+      index = index + 1
+    end
+  end
+
+  if literal ~= "" then
+    table.insert(tokens, new PatternToken("", 0, literal))
+  end
+
+  return tokens
+end
+
+local function matchName(input: string, position: number, names: string[]): (number, number)
+  local bestIndex = 0
+  local bestLength = 0
+  for index = 1, #names do
+    local name = names[index]
+    local candidate = string.sub(input, position, position + #name - 1)
+    if #name > bestLength and string.lower(candidate) == string.lower(name) then
+      bestIndex = index
+      bestLength = #name
+    end
+  end
+
+  return bestIndex, bestLength
+end
+
+local function matchOffset(input: string, position: number, allowZulu: boolean): (number, number)
+  if allowZulu and string.sub(input, position, position) == "Z" then
+    return 0, 1
+  end
+
+  local whole = string.match(input, "^[+-]%d%d:?%d%d", position) ?? string.match(input, "^[+-]%d%d", position)
+  if whole == nil then
+    return 0, 0
+  end
+
+  local digits, _ = string.gsub(whole, "[^%d]", "")
+  local offset = (tonumber(string.sub(digits, 1, 2)) ?? 0) * 60 + (tonumber(string.sub(digits, 3, 4)) ?? 0)
+  if string.sub(whole, 1, 1) == "-" then
+    offset = -offset
+  end
+
+  return offset, #whole
+end
+
+--- Formats and parses DateTime objects with a pattern.
+---
+--- Supported letters:
+--- yyyy year, yy two digit year, M month, MM padded month, MMM short month name, MMMM full month name,
+--- d day, dd padded day, D day of year, E or EEE short day name, EEEE full day name, u day of week from 1 to 7,
+--- H hour 0-23, h hour 1-12, a AM/PM marker, m minute, s second, S to SSS fraction of second,
+--- XXX offset like "+02:00" or "Z", XX "+0200" or "Z", X "+02" or "Z", xxx/xx/x the same without "Z",
+--- Z offset like "+0200", z zone abbreviation like "CEST", VV zone id like "Europe/Berlin".
+--- Text in single quotes is copied literally and two single quotes produce one quote.
+export class StringDateFormat implements DateFormat
+
+  protected _pattern: string = ""
+  protected _tokens: PatternToken[] = {}
+  protected _zone: TimeZone? = nil
+  protected _locale: DateLocale = DateLocale.ENGLISH
+  protected _hasTime: boolean = false
+  protected _dateOnlyFormat: StringDateFormat? = nil
+  protected _fallbacks: StringDateFormat[] = {}
+
+  --- Creates a format from the given pattern. If a zone is given, values are converted into it before formatting and parsed values without an offset are interpreted in it.
+  constructor(pattern: string, zone: TimeZone? = nil, locale: DateLocale? = nil)
+    self._pattern = pattern
+    self._tokens = tokenizePattern(pattern)
+    self._zone = zone
+    self._locale = locale ?? DateLocale.ENGLISH
+    for index = 1, #self._tokens do
+      if containsLetter(TIME_LETTERS, self._tokens[index].letter) and self._tokens[index].letter ~= "" then
+        self._hasTime = true
+      end
+    end
+  end
+
+  --- Returns the pattern of this format.
+  function getPattern(): string
+    return self._pattern
+  end
+
+  --- Returns the zone values are converted into, if any.
+  function getZone(): TimeZone?
+    return self._zone
+  end
+
+  --- Returns the locale used for month and day names.
+  function getLocale(): DateLocale
+    return self._locale
+  end
+
+  function toString(dt: DateTime): string
+    local dateOnlyFormat = self._dateOnlyFormat
+    if dt:isDateOnly() and dateOnlyFormat ~= nil then
+      return dateOnlyFormat:toString(dt)
+    end
+
+    return self:formatTokens(dt)
+  end
+
+  function fromString(str: string): DateTime?
+    local result = self:parseTokens(str)
+    if result ~= nil then
+      return result
+    end
+
+    for index = 1, #self._fallbacks do
+      local fallback = self._fallbacks[index]:fromString(str)
+      if fallback ~= nil then
+        return fallback
+      end
+    end
+
+    local dateOnlyFormat = self._dateOnlyFormat
+    if dateOnlyFormat ~= nil then
+      return dateOnlyFormat:fromString(str)
+    end
+
+    return nil
+  end
+
+  protected function formatTokens(dt: DateTime): string
+    local target = dt
+    local zone = self._zone
+    if zone ~= nil and not dt:isDateOnly() then
+      target = dt:withZone(zone)
+    end
+
+    local parts: string[] = {}
+    for index = 1, #self._tokens do
+      table.insert(parts, self:formatToken(target, self._tokens[index]))
+    end
+
+    return table.concat(parts)
+  end
+
+  protected function formatToken(dt: DateTime, token: PatternToken): string
+    local letter = token.letter
+    local width = token.width
+    local locale = self._locale
+    if letter == "" then
+      return token.text
+    elseif letter == "y" then
+      if width == 2 then
+        return pad(dt:getYear() % 100, 2)
+      end
+
+      return pad(dt:getYear(), width)
+    elseif letter == "M" then
+      if width == 3 then
+        return locale.monthShortNames[dt:getMonth()]
+      elseif width >= 4 then
+        return locale.monthNames[dt:getMonth()]
+      end
+
+      return pad(dt:getMonth(), width)
+    elseif letter == "d" then
+      return pad(dt:getDay(), width)
+    elseif letter == "D" then
+      return pad(dt:getDayOfYear(), width)
+    elseif letter == "E" then
+      if width >= 4 then
+        return locale.dayNames[dt:getDayOfWeek() as number]
+      end
+
+      return locale.dayShortNames[dt:getDayOfWeek() as number]
+    elseif letter == "u" then
+      return tostring(dt:getDayOfWeek() as number)
+    elseif letter == "H" then
+      return pad(dt:getHour(), width)
+    elseif letter == "h" then
+      local hour = dt:getHour() % 12
+      return pad(hour == 0 and 12 or hour, width)
+    elseif letter == "a" then
+      return dt:getHour() < 12 and locale.am or locale.pm
+    elseif letter == "m" then
+      return pad(dt:getMinute(), width)
+    elseif letter == "s" then
+      return pad(dt:getSecond(), width)
+    elseif letter == "S" then
+      local fraction = pad(dt:getMillisecond(), 3)
+      if width <= 3 then
+        return string.sub(fraction, 1, width)
+      end
+
+      return fraction .. string.rep("0", width - 3)
+    elseif letter == "X" or letter == "x" then
+      local offset = dt:getOffset()
+      if letter == "X" and offset == 0 then
+        return "Z"
+      elseif width == 1 then
+        local compact = TimeZone.formatOffset(offset, false)
+        if offset % 60 ~= 0 then
+          return compact
+        end
+
+        return string.sub(compact, 1, 3)
+      end
+
+      return TimeZone.formatOffset(offset, width >= 3)
+    elseif letter == "Z" then
+      return TimeZone.formatOffset(dt:getOffset(), width >= 5)
+    elseif letter == "z" then
+      return dt:getZoneName()
+    end
+
+    return dt:getZone():getId()
+  end
+
+  protected function parseTokens(input: string): DateTime?
+    local position = 1
+    local year = 1970
+    local month = 1
+    local day = 1
+    local hour = 0
+    local minute = 0
+    local second = 0
+    local millisecond = 0
+    local isPm: boolean? = nil
+    local hourIsTwelveBased = false
+    local offset: number? = nil
+    local zone: TimeZone? = nil
+    local locale = self._locale
+
+    for index = 1, #self._tokens do
+      local token = self._tokens[index]
+      local letter = token.letter
+      if letter == "" then
+        if string.sub(input, position, position + #token.text - 1) ~= token.text then
+          return nil
+        end
+
+        position = position + #token.text
+      elseif token:isNumeric() then
+        local nextToken = self._tokens[index + 1]
+        local fixedWidth = nextToken ~= nil and nextToken:isNumeric()
+        local maxDigits = (fixedWidth or (letter == "y" and token.width == 2)) and token.width or 9
+        local minDigits = fixedWidth and token.width or 1
+        local matchedDigits = string.match(input, "^%d+", position)
+        if matchedDigits == nil then
+          return nil
+        end
+
+        local digits: string = matchedDigits
+        if #digits > maxDigits then
+          digits = string.sub(digits, 1, maxDigits)
+        end
+
+        if #digits < minDigits then
+          return nil
+        end
+
+        position = position + #digits
+        local value = tonumber(digits) ?? 0
+        if letter == "y" then
+          year = token.width == 2 and 2000 + value or value
+        elseif letter == "M" then
+          month = value
+        elseif letter == "d" then
+          day = value
+        elseif letter == "H" then
+          hour = value
+        elseif letter == "h" then
+          hour = value
+          hourIsTwelveBased = true
+        elseif letter == "m" then
+          minute = value
+        elseif letter == "s" then
+          second = value
+        elseif letter == "S" then
+          millisecond = tonumber(string.sub(digits .. "00", 1, 3)) ?? 0
+        end
+      elseif letter == "M" or letter == "E" then
+        local fullNames = letter == "M" and locale.monthNames or locale.dayNames
+        local shortNames = letter == "M" and locale.monthShortNames or locale.dayShortNames
+        local matched, length = matchName(input, position, fullNames)
+        if matched == 0 then
+          matched, length = matchName(input, position, shortNames)
+        end
+
+        if matched == 0 then
+          return nil
+        end
+
+        if letter == "M" then
+          month = matched
+        end
+
+        position = position + length
+      elseif letter == "a" then
+        local matched, length = matchName(input, position, { locale.am, locale.pm })
+        if matched == 0 then
+          return nil
+        end
+
+        isPm = matched == 2
+        position = position + length
+      elseif letter == "X" or letter == "x" or letter == "Z" then
+        local parsed, length = matchOffset(input, position, letter ~= "x")
+        if length == 0 then
+          return nil
+        end
+
+        offset = parsed
+        position = position + length
+      elseif letter == "z" then
+        local name = string.match(input, "^%a+", position)
+        if name == nil then
+          return nil
+        end
+
+        local found = TimeZone.fromAbbreviation(name)
+        if found == nil then
+          return nil
+        end
+
+        zone = found
+        offset = found:getOffsetOfName(name)
+        position = position + #name
+      elseif letter == "V" then
+        local id = string.match(input, "^[%w_/+:%-]+", position)
+        if id == nil then
+          return nil
+        end
+
+        local found = TimeZone.of(id)
+        if found == nil then
+          return nil
+        end
+
+        zone = found
+        position = position + #id
+      end
+    end
+
+    if position <= #input then
+      return nil
+    end
+
+    if hourIsTwelveBased then
+      if hour < 1 or hour > 12 then
+        return nil
+      end
+
+      hour = hour % 12
+    end
+
+    if isPm == true then
+      hour = hour + 12
+    end
+
+    if not Calendar.isValidDate(year, month, day) or not Calendar.isValidTime(hour, minute, second, millisecond) then
+      return nil
+    end
+
+    if not self._hasTime and offset == nil and zone == nil then
+      return DateTime.date(year, month, day)
+    end
+
+    local localMs = Calendar.daysFromCivil(year, month, day) * MS_PER_DAY
+      + hour * MS_PER_HOUR + minute * MS_PER_MINUTE + second * MS_PER_SECOND + millisecond
+    if offset ~= nil then
+      local epoch = localMs - offset * MS_PER_MINUTE
+      local resultZone = zone
+      if resultZone == nil then
+        resultZone = TimeZone.fixed(offset)
+        local formatZone = self._zone
+        if formatZone ~= nil then
+          if formatZone:getOffset(epoch) == offset then
+            resultZone = formatZone
+          end
+        end
+      end
+
+      return new DateTime(epoch, resultZone)
+    end
+
+    local resolvedZone = zone ?? self._zone ?? TimeZone.getDefault()
+    return new DateTime(resolvedZone:toUtcEpoch(localMs), resolvedZone)
+  end
+end
+
+--- Formats DateTime objects as ISO 8601 like "2026-10-16T14:30:00.000+02:00" and date only values as "2026-10-16".
+--- Parsing accepts the forms with and without fraction, seconds and offset.
+export class ISODateFormat extends StringDateFormat
+
+  constructor(zone: TimeZone? = nil)
+    super("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", zone)
+    self._dateOnlyFormat = new StringDateFormat("yyyy-MM-dd")
+    self._fallbacks = {
+      new StringDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", zone),
+      new StringDateFormat("yyyy-MM-dd'T'HH:mmXXX", zone),
+      new StringDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", zone),
+      new StringDateFormat("yyyy-MM-dd'T'HH:mm:ss", zone),
+      new StringDateFormat("yyyy-MM-dd'T'HH:mm", zone)
+    }
+  end
+end
+
+--- Formats DateTime objects for SQL databases as "2026-10-16 12:30:00" in UTC and date only values as "2026-10-16".
+--- Parsing accepts the forms with and without fraction and interprets values as UTC unless another zone is given.
+export class SqlDateFormat extends StringDateFormat
+
+  constructor(zone: TimeZone? = nil)
+    super("yyyy-MM-dd HH:mm:ss", zone ?? TimeZone.UTC)
+    self._dateOnlyFormat = new StringDateFormat("yyyy-MM-dd")
+    self._fallbacks = {
+      new StringDateFormat("yyyy-MM-dd HH:mm:ss.SSS", zone ?? TimeZone.UTC)
+    }
+  end
+end
+
+ISO_FORMAT = new ISODateFormat()
+DateTime.defaultFormat = ISO_FORMAT

@@ -1,0 +1,34 @@
+import { mapClass } from "./Mapping"
+
+--- @Embeddable marks a class whose fields are stored in the columns of the entities embedding it with @Embedded, like an address
+--- or a position. It only has @Column fields and no id, relations or indexes.
+---
+---     @Embeddable
+---     class Address
+---         @Column
+---         street: string
+---
+---         @Column(length = 64)
+---         city: string
+---     end
+---
+--- generates, after the class:
+---
+---     NanosORM.embeddable(Address):column("street", "string", false):column("city", "string", false):length(64):build()
+
+export local annotation = {
+    targets = { "Class" },
+    params = {}
+}
+
+export function apply(target, args)
+    local className = target.name.name
+    if target.accessors ~= nil and #target.accessors > 0 then
+        error("Embeddable '" .. className .. "' must not declare getters or setters, they conflict with the change tracking of the ORM")
+    end
+
+    local chain = ir.call(ir.dotAccess(ir.nameExpr("NanosORM"), "embeddable"), { ir.nameExpr(className) })
+    chain = mapClass(chain, target, false)
+    chain = ir.methodCall(chain, "build", {})
+    return { target, ir.exprStmt(chain) }
+end

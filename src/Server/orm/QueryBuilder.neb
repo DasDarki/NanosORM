@@ -1,0 +1,157 @@
+import type { Repository } from "./EntityManager"
+import { Expr } from "./Expression"
+
+--- Builds a query of one entity class step by step and runs it with the repository. Every method returns the builder, except the
+--- ones running the query, which pass their result to a callback and can be awaited:
+---
+---     local players = await em:getRepository(PlayerModel):createQueryBuilder()
+---       :where({ level = Expr.gte(10) })
+---       :orWhere({ ["guild.name"] = "Admins" })
+---       :with("guild")
+---       :orderBy("level DESC")
+---       :limit(20)
+---       :getResult()
+---
+--- where combines the criteria with the previous ones using AND, orWhere with OR.
+export class QueryBuilder
+
+  local _repository: Repository
+  local _criteria: any = nil
+  local _with: string[] = {}
+  local _orderBy: string[] = {}
+  local _limit: number? = nil
+  local _offset: number? = nil
+  local _withDeleted: boolean = false
+  local _eager: boolean = true
+
+  constructor(repository: Repository)
+    self._repository = repository
+  end
+
+  --- Adds criteria that have to match as well.
+  function where(criteria: any): QueryBuilder
+    local current = self._criteria
+    if current == nil then
+      self._criteria = criteria
+    else
+      self._criteria = { Expr.allOf(current, criteria) }
+    end
+
+    return self
+  end
+
+  --- Adds criteria that may match instead of the previous ones.
+  function orWhere(criteria: any): QueryBuilder
+    local current = self._criteria
+    if current == nil then
+      self._criteria = criteria
+    else
+      self._criteria = { Expr.anyOf(current, criteria) }
+    end
+
+    return self
+  end
+
+  --- Loads the given relation paths with the result, for example with("guild", "houses.rooms").
+  function with(...paths: string): QueryBuilder
+    for _, path in ipairs({ ... }) do
+      table.insert(self._with, path)
+    end
+
+    return self
+  end
+
+  --- Adds order entries, for example orderBy("level DESC", "name").
+  function orderBy(...entries: string): QueryBuilder
+    for _, entry in ipairs({ ... }) do
+      table.insert(self._orderBy, entry)
+    end
+
+    return self
+  end
+
+  --- Limits the number of results.
+  function limit(count: number): QueryBuilder
+    self._limit = count
+    return self
+  end
+
+  --- Skips the given number of results.
+  function offset(count: number): QueryBuilder
+    self._offset = count
+    return self
+  end
+
+  --- Includes soft deleted entities.
+  function withDeleted(flag: boolean = true): QueryBuilder
+    self._withDeleted = flag
+    return self
+  end
+
+  --- Defines whether eager relations are loaded, which they are by default.
+  function eager(flag: boolean = true): QueryBuilder
+    self._eager = flag
+    return self
+  end
+
+  --- Returns the criteria built so far.
+  function getCriteria(): any
+    return self._criteria
+  end
+
+  --- Returns the options of the query for Repository.query.
+  function getOptions(): any
+    local options: any = { withDeleted = self._withDeleted, eager = self._eager, limit = self._limit, offset = self._offset }
+    if #self._with > 0 then
+      options.with = self._with
+    end
+
+    if #self._orderBy > 0 then
+      options.orderBy = self._orderBy
+    end
+
+    return options
+  end
+
+  --- Runs the query and passes the matching entities.
+  function getResult(callback: (any[]?, string?) -> void): void
+    self._repository:query(self._criteria, self:getOptions(), callback)
+  end
+
+  --- Runs the query with a limit of 1 and passes the first matching entity, or nil.
+  function getOne(callback: (any, string?) -> void): void
+    local options = self:getOptions()
+    options.limit = 1
+    self._repository:query(self._criteria, options, function(entities: any[]?, err: string?): void
+      if entities == nil then
+        callback(nil, err)
+      else
+        callback(entities[1], nil)
+      end
+    end)
+  end
+
+  --- Counts the matching entities, ignoring order, limit and offset.
+  function count(callback: (number?, string?) -> void): void
+    self._repository:count(self._criteria, { withDeleted = self._withDeleted }, callback)
+  end
+
+  --- Runs an aggregate query over the matching entities. The spec has the keys select, groupBy, having and orderBy of Repository.aggregate.
+  --- Order, limit and offset of the builder are used if the spec has none.
+  function aggregate(spec: any, callback: (any[]?, string?) -> void): void
+    local merged: any = {}
+    for key, value in pairs(spec) do
+      merged[key] = value
+    end
+
+    merged.where = self._criteria
+    merged.withDeleted = self._withDeleted
+    if merged.orderBy == nil and #self._orderBy > 0 then
+      merged.orderBy = self._orderBy
+    end
+
+    merged.limit = merged.limit ?? self._limit
+    merged.offset = merged.offset ?? self._offset
+    self._repository:aggregate(merged, callback)
+  end
+end

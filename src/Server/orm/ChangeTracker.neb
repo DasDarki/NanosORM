@@ -1,0 +1,382 @@
+import { EntityMetadata, EmbeddedMetadata, MetadataRegistry } from "./Metadata"
+
+local STATE_KEY = {}
+
+local FORWARDED_METAMETHODS: string[] = {
+  "__tostring", "__eq", "__lt", "__le", "__add", "__sub", "__mul", "__div", "__mod",
+  "__pow", "__unm", "__idiv", "__concat", "__len", "__call", "__close"
+}
+
+local function stateOf(entity: any): any
+  if type(entity) ~= "table" then
+    return nil
+  end
+
+  return rawget(entity, STATE_KEY)
+end
+
+local function createTrackingMetatable(metadata: EntityMetadata): any
+  local entityClass = metadata.entityClass
+  local metatable: any = {}
+  metatable.__name = rawget(entityClass, "__name")
+  metatable.__entityClass = entityClass
+  metatable.__index = function(entity: any, key: any): any
+    local state = rawget(entity, STATE_KEY)
+    if state ~= nil and metadata:isTracked(key) then
+      return state.values[key]
+    end
+
+    return entityClass[key]
+  end
+
+  metatable.__newindex = function(entity: any, key: any, value: any): void
+    local state = rawget(entity, STATE_KEY)
+    if state == nil or not metadata:isTracked(key) then
+      rawset(entity, key, value)
+      return
+    end
+
+    local current = state.values[key]
+    if current == value then
+      return
+    end
+
+    if not state.dirty[key] then
+      state.dirty[key] = true
+      state.original[key] = current
+      local listener = state.listener
+      if listener ~= nil then
+        listener(entity)
+      end
+    elseif state.original[key] == value then
+      state.dirty[key] = nil
+      state.original[key] = nil
+    end
+
+    state.values[key] = value
+  end
+
+  metatable.__pairs = function(entity: any): any
+    local merged: any = {}
+    for key, value in next, entity do
+      if key ~= STATE_KEY then
+        merged[key] = value
+      end
+    end
+
+    local state = rawget(entity, STATE_KEY)
+    if state ~= nil then
+      for key, value in pairs(state.values) do
+        merged[key] = value
+      end
+    end
+
+    return next, merged, nil
+  end
+
+  for index = 1, #FORWARDED_METAMETHODS do
+    local name = FORWARDED_METAMETHODS[index]
+    local handler = entityClass[name]
+    if handler ~= nil then
+      metatable[name] = handler
+    end
+  end
+
+  setmetatable(metatable, { __index = entityClass })
+  return metatable
+end
+
+--- Tracks which columns of managed entities were changed. Column values of a managed entity live in a hidden table,
+--- so every assignment passes through __newindex and marks the column dirty. Assigning the original value again clears the flag.
+--- Values that can change internally, like Json, are checked with their own isDirty method. Embedded objects are compared with a
+--- snapshot of their fields taken when the entity was last clean.
+export class ChangeTracker
+
+  --- Starts tracking the given entity. Its current column and relation values become the clean state.
+  --- An uninitialized entity is a reference that only knows its id until it is loaded.
+  static function manage(entity: any, metadata: EntityMetadata? = nil, initialized: boolean = true): void
+    if stateOf(entity) ~= nil then
+      return
+    end
+
+    local resolved = metadata ?? MetadataRegistry.ofEntity(entity)
+    if resolved == nil then
+      error("Cannot track an object that is not a mapped entity", 2)
+    end
+
+    if resolved.isMappedSuperclass then
+      error("Cannot track an instance of the mapped superclass '" .. resolved.className .. "'", 2)
+    end
+
+    local values: any = {}
+    for index = 1, #resolved.columns do
+      local fieldName = resolved.columns[index].fieldName
+      values[fieldName] = rawget(entity, fieldName)
+      rawset(entity, fieldName, nil)
+    end
+
+    for index = 1, #resolved.relations do
+      local fieldName = resolved.relations[index].fieldName
+      values[fieldName] = rawget(entity, fieldName)
+      rawset(entity, fieldName, nil)
+    end
+
+    for _, embedded in ipairs(resolved.embeddeds) do
+      local value = rawget(entity, embedded.fieldName)
+      if value == nil and not embedded.nullable then
+        value = embedded:createInstance()
+      end
+
+      values[embedded.fieldName] = value
+      rawset(entity, embedded.fieldName, nil)
+    end
+
+    if resolved.trackingMetatable == nil then
+      resolved.trackingMetatable = createTrackingMetatable(resolved)
+    end
+
+    rawset(entity, STATE_KEY, { values = values, dirty = {}, original = {}, snapshots = {}, metadata = resolved, initialized = initialized })
+    setmetatable(entity, resolved.trackingMetatable)
+    ChangeTracker.markClean(entity)
+  end
+
+  --- Changes the class of a tracked entity to a class of the same inheritance hierarchy, for example when a reference created for the
+  --- root turns out to be a subclass while loading it.
+  static function retype(entity: any, metadata: EntityMetadata): void
+    local state = stateOf(entity)
+    if state == nil then
+      return
+    end
+
+    if metadata.trackingMetatable == nil then
+      metadata.trackingMetatable = createTrackingMetatable(metadata)
+    end
+
+    state.metadata = metadata
+    setmetatable(entity, metadata.trackingMetatable)
+  end
+
+  --- Stops tracking the given entity and moves its column values back onto the instance.
+  static function detach(entity: any): void
+    local state = stateOf(entity)
+    if state == nil then
+      return
+    end
+
+    local metadata = state.metadata as EntityMetadata
+    rawset(entity, STATE_KEY, nil)
+    setmetatable(entity, metadata.entityClass)
+    for key, value in pairs(state.values) do
+      rawset(entity, key, value)
+    end
+  end
+
+  --- Returns whether the entity is fully loaded. References created from foreign keys only know their id until they are loaded.
+  static function isInitialized(entity: any): boolean
+    local state = stateOf(entity)
+    return state == nil or state.initialized == true
+  end
+
+  --- Marks an entity as fully loaded and clean, for example after all of its fields were set from the database.
+  static function markInitialized(entity: any): void
+    local state = stateOf(entity)
+    if state == nil then
+      return
+    end
+
+    state.initialized = true
+    ChangeTracker.markClean(entity)
+  end
+
+  --- Fills an uninitialized reference with loaded values and marks it initialized and clean.
+  static function initialize(entity: any, values: { [string]: any }): void
+    local state = stateOf(entity)
+    if state == nil then
+      return
+    end
+
+    for key, value in pairs(values) do
+      state.values[key] = value
+    end
+
+    state.initialized = true
+    ChangeTracker.markClean(entity)
+  end
+
+  --- Sets the function called whenever the entity gets a change that has to be written, used to keep changed entities in memory.
+  static function setListener(entity: any, listener: ((any) -> void)?): void
+    local state = stateOf(entity)
+    if state ~= nil then
+      state.listener = listener
+    end
+  end
+
+  --- Reports a change of the entity that its fields do not show, like a recorded collection change.
+  static function touch(entity: any): void
+    local state = stateOf(entity)
+    if state ~= nil and state.listener ~= nil then
+      state.listener(entity)
+    end
+  end
+
+  --- Returns whether the given entity is tracked.
+  static function isManaged(entity: any): boolean
+    return stateOf(entity) ~= nil
+  end
+
+  --- Returns whether the given column, or any column if no field is given, was changed since the entity was last clean.
+  static function isDirty(entity: any, fieldName: string? = nil): boolean
+    local state = stateOf(entity)
+    if state == nil then
+      return false
+    end
+
+    if fieldName ~= nil then
+      local embedded = (state.metadata as EntityMetadata):getEmbedded(fieldName)
+      if embedded ~= nil and ChangeTracker.hasEmbeddedChange(state, embedded) then
+        return true
+      end
+
+      return state.dirty[fieldName] == true or ChangeTracker.hasInternalChange(state.values[fieldName])
+    end
+
+    for key, _ in pairs(state.dirty) do
+      return true
+    end
+
+    for _, embedded in ipairs((state.metadata as EntityMetadata).embeddeds) do
+      if ChangeTracker.hasEmbeddedChange(state, embedded) then
+        return true
+      end
+    end
+
+    for _, value in pairs(state.values) do
+      if ChangeTracker.hasInternalChange(value) then
+        return true
+      end
+    end
+
+    return false
+  end
+
+  --- Returns the changed columns as a table from field name to { old, new }. Values with internal changes have the same old and new value.
+  --- For embedded fields old is a table of the field values the embedded object had when the entity was last clean.
+  static function getChanges(entity: any): { [string]: { old: any, new: any } }
+    local changes: { [string]: { old: any, new: any } } = {}
+    local state = stateOf(entity)
+    if state == nil then
+      return changes
+    end
+
+    for key, _ in pairs(state.dirty) do
+      changes[key as string] = { old = state.original[key], new = state.values[key] }
+    end
+
+    for key, value in pairs(state.values) do
+      if changes[key as string] == nil and ChangeTracker.hasInternalChange(value) then
+        changes[key as string] = { old = value, new = value }
+      end
+    end
+
+    for _, embedded in ipairs((state.metadata as EntityMetadata).embeddeds) do
+      if changes[embedded.fieldName] ~= nil or ChangeTracker.hasEmbeddedChange(state, embedded) then
+        changes[embedded.fieldName] = { old = state.snapshots[embedded.fieldName], new = state.values[embedded.fieldName] }
+      end
+    end
+
+    return changes
+  end
+
+  --- Returns the current column values of a tracked entity as a table from field name to value.
+  static function getValues(entity: any): { [string]: any }
+    local result: { [string]: any } = {}
+    local state = stateOf(entity)
+    if state == nil then
+      return result
+    end
+
+    for key, value in pairs(state.values) do
+      result[key as string] = value
+    end
+
+    return result
+  end
+
+  --- Sets a column of a tracked entity without marking it dirty, for example an id generated by the database.
+  static function setClean(entity: any, fieldName: string, value: any): void
+    local state = stateOf(entity)
+    if state == nil then
+      rawset(entity, fieldName, value)
+      return
+    end
+
+    state.values[fieldName] = value
+    state.dirty[fieldName] = nil
+    state.original[fieldName] = nil
+    local embedded = (state.metadata as EntityMetadata):getEmbedded(fieldName)
+    if embedded ~= nil then
+      ChangeTracker.takeSnapshot(state, embedded)
+    end
+  end
+
+  --- Marks all columns of the given entity as clean, for example after it was saved.
+  static function markClean(entity: any): void
+    local state = stateOf(entity)
+    if state == nil then
+      return
+    end
+
+    state.dirty = {}
+    state.original = {}
+    for _, value in pairs(state.values) do
+      if type(value) == "table" and type(value.markClean) == "function" then
+        value:markClean()
+      end
+    end
+
+    for _, embedded in ipairs((state.metadata as EntityMetadata).embeddeds) do
+      ChangeTracker.takeSnapshot(state, embedded)
+    end
+  end
+
+  local static function takeSnapshot(state: any, embedded: EmbeddedMetadata): void
+    local object = state.values[embedded.fieldName]
+    if object == nil then
+      state.snapshots[embedded.fieldName] = nil
+      return
+    end
+
+    local snapshot: { [string]: any } = {}
+    for _, column in ipairs(embedded.columns) do
+      local value = embedded:readValue(object, column)
+      if type(value) == "table" and type(value.markClean) == "function" then
+        value:markClean()
+      end
+
+      snapshot[column.property as string] = value
+    end
+
+    state.snapshots[embedded.fieldName] = snapshot
+  end
+
+  local static function hasEmbeddedChange(state: any, embedded: EmbeddedMetadata): boolean
+    local object = state.values[embedded.fieldName]
+    local snapshot = state.snapshots[embedded.fieldName]
+    if object == nil or snapshot == nil then
+      return (object == nil) ~= (snapshot == nil)
+    end
+
+    for _, column in ipairs(embedded.columns) do
+      local value = embedded:readValue(object, column)
+      if value ~= snapshot[column.property] or ChangeTracker.hasInternalChange(value) then
+        return true
+      end
+    end
+
+    return false
+  end
+
+  local static function hasInternalChange(value: any): boolean
+    return type(value) == "table" and type(value.isDirty) == "function" and value:isDirty() == true
+  end
+end

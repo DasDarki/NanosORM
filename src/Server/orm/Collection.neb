@@ -1,0 +1,463 @@
+import { RelationMetadata, RelationKind } from "./Metadata"
+import { ChangeTracker } from "./ChangeTracker"
+
+--- A list of entities for a to-many relation. It can be looped directly with for index, item in collection do, and items are stored
+--- on integer keys, so #collection, collection[1] and ipairs work as usual.
+---
+--- Changes keep both sides of the relation in sync: adding a house to user.houses sets house.owner, adding a group to user.groups
+--- also adds the user to group.members if that collection is loaded. Changes of ManyToMany relations are recorded and written as
+--- single join table rows on flush, even if the collection was never loaded.
+---
+--- Collections of loaded entities start uninitialized. Reading them raises an error until they are loaded with em:load or the with option.
+export class Collection<T>
+
+  local _initialized: boolean = true
+  local _owner: any = nil
+  local _relation: RelationMetadata? = nil
+  local _insertions: { [any]: boolean } = {}
+  local _deletions: { [any]: boolean } = {}
+  local _cleared: boolean = false
+  local _orphans: { [any]: boolean } = {}
+  local _pendingAdds: { [any]: boolean } = {}
+
+  --- Creates an initialized collection with the given items.
+  constructor(items: T[]? = nil)
+    if items ~= nil then
+      for index = 1, #items do
+        rawset(self, index, items[index])
+      end
+    end
+  end
+
+  --- Returns whether the value is a Collection.
+  static function isCollection(value: any): boolean
+    return type(value) == "table" and getmetatable(value) == Collection
+  end
+
+  --- Returns the number of items.
+  function size(): number
+    self:requireInitialized("size")
+    return rawlen(self)
+  end
+
+  --- Returns whether the collection has no items.
+  function isEmpty(): boolean
+    return self:size() == 0
+  end
+
+  --- Returns the item at the given position.
+  function get(index: number): T?
+    self:requireInitialized("get")
+    return rawget(self, index)
+  end
+
+  --- Returns the first item.
+  function first(): T?
+    return self:get(1)
+  end
+
+  --- Returns the last item.
+  function last(): T?
+    return self:get(self:size())
+  end
+
+  --- Returns the position of the item, or nil if it is not part of the collection.
+  function indexOf(item: T): number?
+    self:requireInitialized("indexOf")
+    for index = 1, rawlen(self) do
+      if rawget(self, index) == item then
+        return index
+      end
+    end
+
+    return nil
+  end
+
+  --- Returns whether the item is part of the collection.
+  function contains(item: T): boolean
+    return self:indexOf(item) ~= nil
+  end
+
+  --- Adds an item and updates the other side of the relation. Adding an item twice has no effect.
+  function add(item: T): void
+    if item == nil then
+      error("Cannot add nil to a collection", 2)
+    end
+
+    if self:addItem(item) then
+      self:syncAdd(item)
+    end
+  end
+
+  --- Removes an item and updates the other side of the relation. Returns whether the item was part of the collection.
+  function remove(item: T): boolean
+    if item == nil then
+      error("Cannot remove nil from a collection", 2)
+    end
+
+    if not self:removeItem(item) then
+      return false
+    end
+
+    self:syncRemove(item)
+    return true
+  end
+
+  --- Removes all items. An uninitialized ManyToMany collection deletes all join table rows of its owner on flush.
+  function clear(): void
+    if not self._initialized then
+      local relation = self._relation
+      if relation == nil or relation.kind ~= RelationKind.ManyToMany or not relation:isOwningSide() then
+        error("Only uninitialized owning ManyToMany collections can be cleared without loading them", 2)
+      end
+
+      self._cleared = true
+      self._insertions = {}
+      self._deletions = {}
+      return
+    end
+
+    local items = self:toArray()
+    for index = 1, #items do
+      self:remove(items[index])
+    end
+  end
+
+  --- Returns the items as a new array.
+  function toArray(): T[]
+    self:requireInitialized("toArray")
+    local result: T[] = {}
+    for index = 1, rawlen(self) do
+      table.insert(result, rawget(self, index))
+    end
+
+    return result
+  end
+
+  --- Returns an iterator over the position and item, so a collection can be looped directly: for index, item in collection do
+  --- Lua code and values of unknown type use __call instead, so the loop looks the same there.
+  function iterator(): () -> (number?, T)
+    self:requireInitialized("iterator")
+    local index = 0
+    return function(): (number?, T)
+      index = index + 1
+      if index > rawlen(self) then
+        return nil, nil!
+      end
+
+      return index, rawget(self, index)
+    end
+  end
+
+  --- Lets the generic for call the collection itself, so for index, item in collection do also works where its type is unknown and in Lua.
+  function __call(_: any, index: number?): (number?, T)
+    self:requireInitialized("iteration")
+    local nextIndex = (index ?? 0) + 1
+    if nextIndex > rawlen(self) then
+      return nil, nil!
+    end
+
+    return nextIndex, rawget(self, nextIndex)
+  end
+
+  --- Calls the function with every item and its position.
+  function forEach(action: (T, number) -> void): void
+    local items = self:toArray()
+    for index = 1, #items do
+      action(items[index], index)
+    end
+  end
+
+  --- Returns the items the predicate accepts.
+  function filter(predicate: (T) -> boolean): T[]
+    local result: T[] = {}
+    local items = self:toArray()
+    for index = 1, #items do
+      if predicate(items[index]) then
+        table.insert(result, items[index])
+      end
+    end
+
+    return result
+  end
+
+  --- Returns the results of the function for every item.
+  function map(mapper: (T) -> any): any[]
+    local result: any[] = {}
+    local items = self:toArray()
+    for index = 1, #items do
+      table.insert(result, mapper(items[index]))
+    end
+
+    return result
+  end
+
+  --- Returns the first item the predicate accepts.
+  function find(predicate: (T) -> boolean): T?
+    local items = self:toArray()
+    for index = 1, #items do
+      if predicate(items[index]) then
+        return items[index]
+      end
+    end
+
+    return nil
+  end
+
+  --- Returns whether the items are loaded.
+  function isInitialized(): boolean
+    return self._initialized
+  end
+
+  --- Connects the collection with the entity and relation it belongs to. Items added before the collection was bound,
+  --- like on a new entity, are synced to the other side and recorded now. Used by the ORM.
+  function bind(owner: any, relation: RelationMetadata, initialized: boolean = true): void
+    local wasBound = self._relation ~= nil
+    self._owner = owner
+    self._relation = relation
+    self._initialized = initialized
+    if wasBound or not initialized then
+      return
+    end
+
+    for index = 1, rawlen(self) do
+      local item = rawget(self, index)
+      if self:isRecording() then
+        self._insertions[item] = true
+      end
+
+      self:syncAdd(item)
+    end
+  end
+
+  --- Replaces the items with loaded ones, keeping changes made before the collection was loaded. Used by the ORM.
+  function initialize(items: T[]): void
+    for index = rawlen(self), 1, -1 do
+      rawset(self, index, nil)
+    end
+
+    local position = 0
+    for index = 1, #items do
+      if not self._deletions[items[index]] then
+        position = position + 1
+        rawset(self, position, items[index])
+      end
+    end
+
+    self._initialized = true
+    for item, _ in pairs(self._insertions) do
+      if self:indexOf(item) == nil then
+        position = position + 1
+        rawset(self, position, item)
+      end
+    end
+
+    for item, _ in pairs(self._pendingAdds) do
+      if self:indexOf(item) == nil then
+        position = position + 1
+        rawset(self, position, item)
+      end
+    end
+
+    self._pendingAdds = {}
+  end
+
+  --- Returns the items added while the collection was not loaded and not flushed yet, for every kind of relation. Used by the ORM.
+  function getPendingAdds(): any[]
+    local result: any[] = {}
+    for item, _ in pairs(self._pendingAdds) do
+      table.insert(result, item)
+    end
+
+    return result
+  end
+
+  --- Forgets the items added while the collection was not loaded, after they were flushed. Used by the ORM.
+  function forgetPendingAdds(): void
+    if next(self._pendingAdds) ~= nil then
+      self._pendingAdds = {}
+    end
+  end
+
+  --- Returns whether there are recorded changes that have to be written to a join table. Used by the ORM.
+  function hasPendingChanges(): boolean
+    return self._cleared or next(self._insertions) ~= nil or next(self._deletions) ~= nil
+  end
+
+  --- Returns the items added since the last flush. Used by the ORM.
+  function getInsertions(): any[]
+    local result: any[] = {}
+    for item, _ in pairs(self._insertions) do
+      table.insert(result, item)
+    end
+
+    return result
+  end
+
+  --- Returns the items removed since the last flush. Used by the ORM.
+  function getDeletions(): any[]
+    local result: any[] = {}
+    for item, _ in pairs(self._deletions) do
+      table.insert(result, item)
+    end
+
+    return result
+  end
+
+  --- Returns whether all join table rows of the owner have to be deleted. Used by the ORM.
+  function isCleared(): boolean
+    return self._cleared
+  end
+
+  --- Returns the items removed from a relation with orphanRemoval since the last call, and forgets them. Used by the ORM.
+  function takeOrphans(): any[]
+    local result: any[] = {}
+    for item, _ in pairs(self._orphans) do
+      table.insert(result, item)
+    end
+
+    self._orphans = {}
+    return result
+  end
+
+  --- Forgets the recorded changes after they were written. Used by the ORM.
+  function commit(): void
+    self._insertions = {}
+    self._deletions = {}
+    self._cleared = false
+  end
+
+  --- Adds an item without updating the other side. Returns whether it was added. Used by the ORM.
+  function addItem(item: any): boolean
+    self._orphans[item] = nil
+    if self._initialized then
+      if self:indexOf(item) ~= nil then
+        return false
+      end
+
+      rawset(self, rawlen(self) + 1, item)
+    else
+      self._pendingAdds[item] = true
+      ChangeTracker.touch(self._owner)
+    end
+
+    if self:isRecording() then
+      if self._deletions[item] then
+        self._deletions[item] = nil
+      else
+        self._insertions[item] = true
+      end
+
+      ChangeTracker.touch(self._owner)
+    end
+
+    return true
+  end
+
+  --- Removes an item without updating the other side. Returns whether it was removed. Used by the ORM.
+  function removeItem(item: any): boolean
+    if self._initialized then
+      local index = self:indexOf(item)
+      if index == nil then
+        return false
+      end
+
+      table.remove(self, index)
+    else
+      self._pendingAdds[item] = nil
+    end
+
+    local relation = self._relation
+    if relation ~= nil and relation.orphanRemoval then
+      self._orphans[item] = true
+      ChangeTracker.touch(self._owner)
+    end
+
+    if self:isRecording() then
+      if self._insertions[item] then
+        self._insertions[item] = nil
+      else
+        self._deletions[item] = true
+      end
+
+      ChangeTracker.touch(self._owner)
+    end
+
+    return true
+  end
+
+  operator #(): number
+    return self:size()
+  end
+
+  local function requireInitialized(operation: string): void
+    if not self._initialized then
+      local relation = self._relation
+      local name = relation ~= nil and relation.fieldName or "collection"
+      error("Cannot use '" .. operation .. "' on the uninitialized collection '" .. name .. "', load it with em:load or the with option first", 3)
+    end
+  end
+
+  local function isRecording(): boolean
+    local relation = self._relation
+    return relation ~= nil and relation.kind == RelationKind.ManyToMany and relation:isOwningSide()
+  end
+
+  local function syncAdd(item: any): void
+    local relation = self._relation
+    if relation == nil then
+      return
+    end
+
+    if relation.kind == RelationKind.OneToMany then
+      item[relation:getMappedRelation().fieldName] = self._owner
+      return
+    end
+
+    local other = relation:getOtherSide()
+    if other == nil then
+      return
+    end
+
+    local otherCollection: any = item[other.fieldName]
+    if not Collection.isCollection(otherCollection) then
+      otherCollection = nil
+    end
+
+    if otherCollection == nil and not relation:isOwningSide() then
+      otherCollection = new Collection()
+      otherCollection:bind(item, other)
+      item[other.fieldName] = otherCollection
+    end
+
+    if otherCollection ~= nil then
+      otherCollection:addItem(self._owner)
+    end
+  end
+
+  local function syncRemove(item: any): void
+    local relation = self._relation
+    if relation == nil then
+      return
+    end
+
+    if relation.kind == RelationKind.OneToMany then
+      local fieldName = relation:getMappedRelation().fieldName
+      if item[fieldName] == self._owner then
+        item[fieldName] = nil
+      end
+
+      return
+    end
+
+    local other = relation:getOtherSide()
+    if other == nil then
+      return
+    end
+
+    local otherCollection: any = item[other.fieldName]
+    if Collection.isCollection(otherCollection) then
+      otherCollection:removeItem(self._owner)
+    end
+  end
+end

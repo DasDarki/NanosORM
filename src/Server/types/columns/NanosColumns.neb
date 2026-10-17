@@ -1,0 +1,125 @@
+import { ColumnType } from "../ColumnType"
+import { Platform } from "../../dbal/Platform"
+
+local function formatNumber(value: number): string
+  local text = string.format("%.4f", value)
+  text = string.gsub(text, "0+$", "")
+  text = string.gsub(text, "%.$", "")
+  return text == "-0" and "0" or text
+end
+
+local function formatNumbers(values: number[]): string
+  local parts: string[] = {}
+  for index = 1, #values do
+    table.insert(parts, formatNumber(values[index]))
+  end
+
+  return "[" .. table.concat(parts, ",") .. "]"
+end
+
+local function parseNumbers(raw: any, count: number): number[]?
+  if raw == nil then
+    return nil
+  end
+
+  local text = tostring(raw)
+  if string.match(text, "^%s*%[?[%d%s,.eE+-]*%]?%s*$") == nil then
+    return nil
+  end
+
+  local values: number[] = {}
+  for token in string.gmatch(text, "[^%s,%[%]]+") do
+    local value = tonumber(token)
+    if value == nil then
+      return nil
+    end
+
+    table.insert(values, value)
+  end
+
+  if #values ~= count then
+    return nil
+  end
+
+  return values
+end
+
+local function toByte(component: number): number
+  return math.floor(math.max(0, math.min(1, component)) * 255 + 0.5)
+end
+
+--- Stores a Vector as JSON array like "[100.5,-20,300]" with up to four decimal places.
+export class VectorColumn implements ColumnType<Vector>
+
+  function getSqlType(platform: Platform): string
+    return platform:getStringType(128)
+  end
+
+  function toDatabase(value: Vector, platform: Platform): any
+    return formatNumbers({ value.X, value.Y, value.Z })
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Vector?
+    local values = parseNumbers(raw, 3)
+    if values == nil then
+      return nil
+    end
+
+    return new Vector(values[1], values[2], values[3])
+  end
+end
+
+--- Stores a Rotator as JSON array like "[0,90,0]" in the order pitch, yaw and roll.
+export class RotatorColumn implements ColumnType<Rotator>
+
+  function getSqlType(platform: Platform): string
+    return platform:getStringType(128)
+  end
+
+  function toDatabase(value: Rotator, platform: Platform): any
+    return formatNumbers({ value.Pitch, value.Yaw, value.Roll })
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Rotator?
+    local values = parseNumbers(raw, 3)
+    if values == nil then
+      return nil
+    end
+
+    return new Rotator(values[1], values[2], values[3])
+  end
+end
+
+--- Stores a Color as hex string like "#FF8000FF". Components are rounded to 8 bit.
+export class ColorColumn implements ColumnType<Color>
+
+  function getSqlType(platform: Platform): string
+    return platform:getFixedStringType(9)
+  end
+
+  function toDatabase(value: Color, platform: Platform): any
+    return string.format("#%02X%02X%02X%02X", toByte(value.R), toByte(value.G), toByte(value.B), toByte(value.A))
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Color?
+    if raw == nil then
+      return nil
+    end
+
+    local hex = string.match(tostring(raw), "^#?(%x+)$")
+    if hex == nil or (#hex ~= 6 and #hex ~= 8) then
+      return nil
+    end
+
+    if #hex == 6 then
+      hex = hex .. "FF"
+    end
+
+    local components: number[] = {}
+    for index = 0, 3 do
+      components[index + 1] = (tonumber(string.sub(hex, index * 2 + 1, index * 2 + 2), 16) ?? 0) / 255
+    end
+
+    return new Color(components[1], components[2], components[3], components[4])
+  end
+end

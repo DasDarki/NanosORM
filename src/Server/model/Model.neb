@@ -1,0 +1,43 @@
+import { DateTime } from "../types/DateTime"
+import { EntityBuilder } from "../orm/EntityBuilder"
+
+--- Base class for entities with creation and update timestamps, which the EntityManager keeps up to date.
+export abstract class Model
+
+  createdAt: DateTime = DateTime.now()
+  updatedAt: DateTime = DateTime.now()
+
+  --- Called by the EntityManager when the entity is persisted. Subclasses overriding it should keep setting both timestamps.
+  function onPrePersist(): void
+    local now = DateTime.now()
+    self.createdAt = now
+    self.updatedAt = now
+  end
+
+  --- Called by the EntityManager before changes of the entity are written.
+  function onPreUpdate(): void
+    self.updatedAt = DateTime.now()
+  end
+
+end
+
+--- Base class for entities that are marked as deleted instead of being removed. Queries skip deleted entities by default.
+export abstract class SoftDeleteModel extends Model
+
+  deletedAt: DateTime? = nil
+
+  --- Returns whether the entity is marked as deleted.
+  function isDeleted(): boolean
+    return self.deletedAt ~= nil
+  end
+
+end
+
+new EntityBuilder(Model, nil, true)
+  :column("createdAt", "DateTime")
+  :column("updatedAt", "DateTime")
+  :build()
+
+new EntityBuilder(SoftDeleteModel, nil, true)
+  :column("deletedAt", "DateTime", true):softDelete()
+  :build()

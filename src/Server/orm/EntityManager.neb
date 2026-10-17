@@ -1,0 +1,1847 @@
+import { EntityMetadata, MetadataRegistry, GenerationStrategy, RelationMetadata, RelationKind } from "./Metadata"
+import { Connection } from "../dbal/Connection"
+import { ChangeTracker } from "./ChangeTracker"
+import { EntityPersister } from "./EntityPersister"
+import { EntityLoader } from "./EntityLoader"
+import { Collection } from "./Collection"
+import { SchemaTool } from "./SchemaTool"
+import { QueryBuilder } from "./QueryBuilder"
+import { getCallingPackage } from "./PackageScope"
+import { TypeRegistry } from "./TypeRegistry"
+import { QueryParams } from "../dbal/Connection"
+import { DateTime } from "../types/DateTime"
+import { Uuid } from "../types/Uuid"
+
+local ENTITY_EVENTS: { [string]: string } = {
+  prePersist = "onPrePersist",
+  postPersist = "onPostPersist",
+  preUpdate = "onPreUpdate",
+  postUpdate = "onPostUpdate",
+  preRemove = "onPreRemove",
+  postRemove = "onPostRemove",
+  postLoad = "onPostLoad"
+}
+
+local FLUSH_EVENTS: { [string]: boolean } = {
+  preFlush = true,
+  postFlush = true
+}
+
+local function isInstanceOf(entity: any, entityClass: any): boolean
+  local current = MetadataRegistry.classOf(entity)
+  while current ~= nil do
+    if current == entityClass then
+      return true
+    end
+
+    current = MetadataRegistry.parentClassOf(current)
+  end
+
+  return false
+end
+
+--- Loads and queries the entities of one class. Results are passed to callbacks as (result, error), so they can be awaited in Nebra:
+---
+---     local users, err = await em:getRepository(UserModel):query({ level = 1 }, { with = { "guild", "houses" } })
+---
+--- Options are tables with the optional keys with (relation paths to load), orderBy (an array like { "createdAt DESC" }), limit, offset and withDeleted.
+export class Repository
+
+  local _entityManager: EntityManager
+  local _persister: EntityPersister
+
+  constructor(entityManager: EntityManager, persister: EntityPersister)
+    self._entityManager = entityManager
+    self._persister = persister
+  end
+
+  --- Returns the metadata of the entity class.
+  function getMetadata(): EntityMetadata
+    return self._persister:getMetadata()
+  end
+
+  --- Finds the entity with the given id.
+  function find(id: any, callback: (any, string?) -> void): void
+    self._entityManager:find(self._persister:getMetadata().entityClass, id, callback)
+  end
+
+  --- Finds all entities.
+  function findAll(callback: (any[]?, string?) -> void): void
+    self:query(nil, nil, callback)
+  end
+
+  --- Finds all entities matching the criteria, a table from field name to value.
+  function findBy(criteria: any, callback: (any[]?, string?) -> void): void
+    self:query(criteria, nil, callback)
+  end
+
+  --- Finds the first entity matching the criteria.
+  function findOneBy(criteria: any, callback: (any, string?) -> void): void
+    self:query(criteria, { limit = 1 }, function(entities: any[]?, err: string?): void
+      if entities == nil then
+        callback(nil, err)
+      else
+        callback(entities[1], nil)
+      end
+    end)
+  end
+
+  --- Finds all entities matching the criteria with the given options for relations, order, limit, offset and soft deleted entities.
+  function query(criteria: any, options: any, callback: (any[]?, string?) -> void): void
+    self._entityManager:getLoader():query(self._persister:getMetadata(), criteria, options, callback)
+  end
+
+  --- Counts the entities matching the criteria. The options can be left out, withDeleted counts soft deleted entities as well.
+  function count(criteria: any, options: any = nil, callback: ((number?, string?) -> void)? = nil): void
+    if type(options) == "function" then
+      callback = options
+      options = nil
+    end
+
+    if callback == nil then
+      error("count needs a callback, or await it", 2)
+    end
+
+    local sql, params = self._persister:buildCount(criteria, options)
+    self._entityManager:getConnection():select(sql, params, function(rows: any[]?, err: string?): void
+      if rows == nil then
+        callback(nil, err)
+      else
+        callback(tonumber(rows[1] ~= nil and rows[1].count or 0) ?? 0, nil)
+      end
+    end)
+  end
+
+  --- Runs an aggregate query and passes its rows, tables from the selected aliases to their values:
+  ---
+  ---     local rows = await repository:aggregate({
+  ---       select = { guild = "guild", members = Agg.count(), level = Agg.avg("level") },
+  ---       where = { level = Expr.gt(1) },
+  ---       having = { members = Expr.gte(5) },
+  ---       orderBy = { "members DESC" }
+  ---     })
+  ---
+  --- select maps result aliases to field paths, also through to-one relations like "guild.name", or Agg functions. groupBy lists field
+  --- paths or selected aliases and defaults to the selected fields. having compares selected aliases, orderBy sorts by selected aliases
+  --- or field paths. limit, offset and withDeleted work as for query. Selected owning to-one relations are passed as entity references.
+  function aggregate(spec: any, callback: (any[]?, string?) -> void): void
+    local ok, sql, params, outputs = pcall(function(): any
+      return self._persister:buildAggregate(spec)
+    end)
+
+    if not ok then
+      callback(nil, tostring(sql))
+      return
+    end
+
+    local loader = self._entityManager:getLoader()
+    self._entityManager:getConnection():select(sql, params, function(rows: any[]?, err: string?): void
+      if rows == nil then
+        callback(nil, err)
+        return
+      end
+
+      local result: any[] = {}
+      for _, row in ipairs(rows) do
+        local values = self._persister:readAggregateRow(row, outputs)
+        for _, output in ipairs(outputs) do
+          local relation = output.relation
+          if relation ~= nil and values[output.alias] ~= nil then
+            values[output.alias] = loader:getReference(relation:getTarget(), values[output.alias])
+          end
+        end
+
+        table.insert(result, values)
+      end
+
+      callback(result, nil)
+    end)
+  end
+
+  --- Starts a QueryBuilder for this entity class.
+  function createQueryBuilder(): QueryBuilder
+    return new QueryBuilder(self)
+  end
+end
+
+--- Manages entities like the Doctrine EntityManager. persist and remove only schedule changes, flush writes them in one go.
+--- Changed columns and owning relations of loaded entities are detected automatically and written on flush as well.
+---
+--- New entities are inserted after the new entities they reference, so generated ids can be used as foreign keys within one flush.
+--- With a pool size of 1 a flush runs in a transaction. Larger pools cannot guarantee that all statements use the same connection,
+--- so a failing flush may leave earlier statements applied.
+export class EntityManager
+
+  local _connection: Connection
+  local _schemaTool: SchemaTool
+  local _loader: EntityLoader
+  local _repositories: { [any]: Repository } = {}
+  local _inserts: any[] = {}
+  local _insertSet: { [any]: boolean } = {}
+  local _deletes: any[] = {}
+  local _deleteSet: { [any]: boolean } = {}
+  local _removing: { [any]: boolean } = {}
+  local _flushing: boolean = false
+  local _transactions: Transaction[] = {}
+  local _rollbackOnly: boolean = false
+  local _transactionEnding: boolean = false
+  local _transactionTimer: number? = nil
+  local _transactionGeneration: number = 0
+  local _waitingBegins: (() -> void)[] = {}
+  local _writtenInTransaction: { [any]: boolean } = {}
+  local _packageName: string? = nil
+  local _schemaPackages: { [string]: boolean } = {}
+  local _allPackages: boolean = false
+  local _listeners: { [string]: any[] } = {}
+  local _pendingEvents: any[] = {}
+
+  constructor(connection: Connection, options: any = nil)
+    self._connection = connection
+    self._packageName = getCallingPackage()
+    local packages = options ~= nil and options.packages or nil
+    if packages == "*" then
+      self._allPackages = true
+    elseif type(packages) == "table" then
+      for _, name in ipairs(packages) do
+        self._schemaPackages[tostring(name)] = true
+      end
+    end
+
+    self._schemaTool = new SchemaTool(connection, function(metadata: EntityMetadata): boolean
+      return self:managesSchemaOf(metadata)
+    end)
+
+    self._loader = new EntityLoader(connection)
+    self._loader:setLoadListener(function(entity: any): void
+      self:dispatch("postLoad", entity, nil)
+    end)
+  end
+
+  --- Opens a connection with the nanos world Database class and creates an EntityManager for it.
+  static function create(engine: DatabaseEngine, connectionString: string, poolSize: number = 1, options: any = nil): EntityManager
+    return new EntityManager(Connection.create(engine, connectionString, poolSize), options)
+  end
+
+  --- Returns the nanos world package this EntityManager was created in, nil outside of nanos world.
+  function getPackageName(): string?
+    return self._packageName
+  end
+
+  --- Returns whether the schema operations of this EntityManager manage the table of the entity. These are the entities of the package
+  --- the EntityManager was created in, of the packages given in the options and of no package, or all with the packages option "*".
+  function managesSchemaOf(metadata: EntityMetadata): boolean
+    local packageName = metadata.packageName
+    if self._allPackages or self._packageName == nil or packageName == nil then
+      return true
+    end
+
+    return packageName == self._packageName or self._schemaPackages[packageName] == true
+  end
+
+  --- Returns the connection.
+  function getConnection(): Connection
+    return self._connection
+  end
+
+  --- Returns the loader holding the identity map.
+  function getLoader(): EntityLoader
+    return self._loader
+  end
+
+  --- Returns the schema tool.
+  function getSchemaTool(): SchemaTool
+    return self._schemaTool
+  end
+
+  --- Returns the persister of the given metadata.
+  function getPersister(metadata: EntityMetadata): EntityPersister
+    return self._loader:getPersister(metadata)
+  end
+
+  --- Creates the tables of all mapped entities that do not exist yet.
+  function createSchema(callback: ((boolean, string?) -> void)? = nil): void
+    self._schemaTool:createSchema(callback)
+  end
+
+  --- Adds missing tables, columns, foreign keys and indexes to the existing database without dropping anything. Meant for development,
+  --- use a Migrator for versioned changes. The callback receives whether it succeeded, the error and warnings about changes that need manual work.
+  function autoMigrate(callback: ((boolean, string?, string[]?) -> void)? = nil): void
+    self._schemaTool:autoMigrate(callback)
+  end
+
+  --- Drops the tables of all mapped entities.
+  function dropSchema(callback: ((boolean, string?) -> void)? = nil): void
+    self._schemaTool:dropSchema(callback)
+  end
+
+  --- Subscribes a listener to a lifecycle event and returns a function that unsubscribes it again.
+  ---
+  --- Entity events call listener(entity, em, extra) and can be limited to an entity class, which includes its subclasses:
+  --- prePersist, preUpdate (extra is the change set), preRemove, postPersist, postUpdate, postRemove and postLoad.
+  --- Flush events call listener(em): preFlush before anything is collected and postFlush after a successful flush.
+  ---
+  --- Pre events run before writing, so they may change the entity or raise an error to abort the flush. Post events of entities run after
+  --- the data was committed, inside a transaction after its commit, and their errors are only logged.
+  --- Entities can also implement methods named after the events, like onPrePersist or onPostUpdate.
+  function on(event: string, listener: any, entityClass: any = nil): () -> void
+    if ENTITY_EVENTS[event] == nil and not FLUSH_EVENTS[event] then
+      error("Unknown event '" .. event .. "'", 2)
+    end
+
+    if FLUSH_EVENTS[event] and entityClass ~= nil then
+      error("The flush event '" .. event .. "' cannot be limited to an entity class", 2)
+    end
+
+    if self._listeners[event] == nil then
+      self._listeners[event] = {}
+    end
+
+    local subscription: any = { listener = listener, entityClass = entityClass }
+    table.insert(self._listeners[event], subscription)
+    return function(): void
+      local list = self._listeners[event] ?? {}
+      for index = #list, 1, -1 do
+        if list[index] == subscription then
+          table.remove(list, index)
+        end
+      end
+    end
+  end
+
+  --- Returns the repository of the given entity class.
+  function getRepository(entityClass: any): Repository
+    local metadata = self:requireMetadata(entityClass)
+    local repository = self._repositories[metadata]
+    if repository == nil then
+      repository = new Repository(self, self:getPersister(metadata))
+      self._repositories[metadata] = repository
+    end
+
+    return repository
+  end
+
+  --- Returns the entity with the given id without loading it. Unknown ids give an uninitialized reference,
+  --- which is enough to assign it to a relation. Load it with load or find to read its other fields.
+  function getReference(entityClass: any, id: any): any
+    return self._loader:getReference(self:requireMetadata(entityClass), id)
+  end
+
+  --- Loads relations of loaded entities, given as single entity or array, for example load(users, { "houses", "guild.leader" }).
+  --- Every relation and level costs one query for all entities together. Loaded collections and references are not queried again.
+  function load(entities: any, paths: any, callback: (boolean, string?) -> void): void
+    self._loader:load(entities, paths, callback)
+  end
+
+  --- Schedules a new entity for insertion. Generated Uuid ids are assigned immediately, auto increment ids during the flush.
+  --- Persisting an entity scheduled for removal cancels the removal. Relations with cascade persist pass the call on.
+  function persist(entity: any): void
+    if self._deleteSet[entity] then
+      self:unschedule(self._deletes, self._deleteSet, entity)
+      return
+    end
+
+    if self:contains(entity) then
+      return
+    end
+
+    local metadata = MetadataRegistry.ofEntity(entity)
+    if metadata == nil or metadata.isMappedSuperclass then
+      error("Cannot persist an object that is not a mapped entity", 2)
+    end
+
+    local idColumn = metadata:getIdColumn()
+    if entity[idColumn.fieldName] == nil and idColumn.generation == GenerationStrategy.Auto and idColumn.typeRef == "Uuid" then
+      entity[idColumn.fieldName] = Uuid.v7()
+    end
+
+    local versionColumn = metadata.versionColumn
+    if versionColumn ~= nil and entity[versionColumn.fieldName] == nil then
+      entity[versionColumn.fieldName] = 1
+    end
+
+    self:dispatch("prePersist", entity, nil)
+    self._loader:attachCollections(metadata, entity, true)
+    ChangeTracker.manage(entity, metadata)
+    table.insert(self._inserts, entity)
+    self._insertSet[entity] = true
+    self:cascadePersist(entity, metadata)
+  end
+
+  --- Schedules an entity for removal. Entities with a soft delete column get the deletion time set instead, unless force is true.
+  --- Relations with cascade remove pass the call on to their loaded entities.
+  function remove(entity: any, force: boolean = false): void
+    if self._removing[entity] then
+      return
+    end
+
+    if self._insertSet[entity] then
+      self:unschedule(self._inserts, self._insertSet, entity)
+      ChangeTracker.detach(entity)
+      return
+    end
+
+    if not self:contains(entity) then
+      error("Cannot remove an entity that is not managed by this EntityManager", 2)
+    end
+
+    local metadata = self:requireMetadata(entity)
+    self._removing[entity] = true
+    self:dispatch("preRemove", entity, nil)
+    for _, relation in ipairs(metadata.relations) do
+      if relation.cascadeRemove then
+        for _, related in ipairs(self:loadedRelated(entity, relation)) do
+          if self:contains(related) then
+            self:remove(related, force)
+          end
+        end
+      end
+    end
+
+    self._removing[entity] = nil
+    local softDeleteColumn = metadata.softDeleteColumn
+    if softDeleteColumn ~= nil and not force then
+      entity[softDeleteColumn.fieldName] = DateTime.now()
+      return
+    end
+
+    if not self._deleteSet[entity] then
+      table.insert(self._deletes, entity)
+      self._deleteSet[entity] = true
+    end
+  end
+
+  --- Returns whether the entity is managed by this EntityManager, either loaded, referenced or scheduled for insertion.
+  function contains(entity: any): boolean
+    if self._insertSet[entity] then
+      return true
+    end
+
+    local metadata = MetadataRegistry.ofEntity(entity)
+    if metadata == nil or metadata.isMappedSuperclass or not ChangeTracker.isManaged(entity) then
+      return false
+    end
+
+    return self._loader:isRegistered(metadata, entity)
+  end
+
+  --- Stops managing the entity. Pending changes of it are discarded.
+  function detach(entity: any): void
+    self:unschedule(self._inserts, self._insertSet, entity)
+    self:unschedule(self._deletes, self._deleteSet, entity)
+    local metadata = MetadataRegistry.ofEntity(entity)
+    if metadata ~= nil and not metadata.isMappedSuperclass and ChangeTracker.isManaged(entity) then
+      self._loader:unregister(metadata, entity)
+    end
+
+    ChangeTracker.detach(entity)
+  end
+
+  --- Detaches all entities.
+  function clear(): void
+    for _, entity in ipairs(self._loader:clear()) do
+      ChangeTracker.detach(entity)
+    end
+
+    for index = 1, #self._inserts do
+      ChangeTracker.detach(self._inserts[index])
+    end
+
+    self._inserts = {}
+    self._insertSet = {}
+    self._deletes = {}
+    self._deleteSet = {}
+  end
+
+  --- Finds the entity of the given class with the given id. Already loaded entities are returned without a query.
+  function find(entityClass: any, id: any, callback: (any, string?) -> void): void
+    local metadata = MetadataRegistry.get(entityClass)
+    if metadata == nil or metadata.isMappedSuperclass then
+      callback(nil, "'" .. tostring(entityClass) .. "' is not a mapped entity")
+      return
+    end
+
+    local persister = self:getPersister(metadata)
+    local known = self._loader:lookup(metadata, persister:identityKey(id))
+    if known ~= nil and ChangeTracker.isInitialized(known) and not isInstanceOf(known, entityClass) then
+      callback(nil, nil)
+      return
+    end
+
+    if known ~= nil and ChangeTracker.isInitialized(known) then
+      local softDeleteColumn = metadata.softDeleteColumn
+      if softDeleteColumn ~= nil and known[softDeleteColumn.fieldName] ~= nil then
+        callback(nil, nil)
+      else
+        callback(known, nil)
+      end
+
+      return
+    end
+
+    local criteria: any = {}
+    criteria[metadata:getIdColumn().fieldName] = id
+    self._loader:query(metadata, criteria, { limit = 1 }, function(entities: any[]?, err: string?): void
+      if entities == nil then
+        callback(nil, err)
+      else
+        callback(entities[1], nil)
+      end
+    end)
+  end
+
+  --- Runs a SELECT written by hand and passes its rows. Values are given with ? placeholders, ?? stands for a literal question mark.
+  --- Entities are passed as their id, value objects like DateTime or Uuid as their stored value and arrays as a list for IN (?).
+  --- With the entity option the rows are read as entities of that class, which needs all of its columns under their plain names,
+  --- for example SELECT p.* FROM player p. The with option then loads relations of them. Params and options can be left out.
+  ---
+  ---     local rows = await em:nativeQuery("SELECT guild_id, COUNT(*) AS members FROM member WHERE level > ? GROUP BY guild_id", { 10 })
+  ---     local players = await em:nativeQuery("SELECT * FROM player WHERE id IN (?)", { ids }, { entity = PlayerModel })
+  function nativeQuery(sql: string, params: any = nil, options: any = nil, callback: ((any[]?, string?) -> void)? = nil): void
+    if type(params) == "function" then
+      callback = params
+      params = nil
+      options = nil
+    elseif type(options) == "function" then
+      callback = options
+      options = nil
+    end
+
+    if callback == nil then
+      error("nativeQuery needs a callback, or await it", 2)
+    end
+
+    local metadata: EntityMetadata? = nil
+    if options ~= nil and options.entity ~= nil then
+      metadata = MetadataRegistry.get(options.entity)
+      if metadata == nil or metadata.isMappedSuperclass then
+        callback(nil, "'" .. tostring(options.entity) .. "' is not a mapped entity")
+        return
+      end
+    end
+
+    local ok, expanded, queryParams = pcall(function(): any
+      return self:expandNativeSql(sql, params ?? {})
+    end)
+
+    if not ok then
+      callback(nil, tostring(expanded))
+      return
+    end
+
+    self._connection:select(expanded, queryParams, function(rows: any[]?, err: string?): void
+      if rows == nil or metadata == nil then
+        callback(rows, err)
+        return
+      end
+
+      local entities: any[] = {}
+      local hydrated, failure = pcall(function(): void
+        for _, row in ipairs(rows) do
+          local entity = self._loader:hydrate(metadata, row, nil)
+          if entity == nil then
+            error("A row of the native query has no '" .. metadata:getIdColumn().columnName .. "' column", 0)
+          end
+
+          table.insert(entities, entity)
+        end
+      end)
+
+      if not hydrated then
+        callback(nil, tostring(failure))
+        return
+      end
+
+      local with = options.with
+      if with == nil or #entities == 0 then
+        callback(entities, nil)
+        return
+      end
+
+      self:load(entities, with, function(loaded: boolean, loadErr: string?): void
+        if loaded then
+          callback(entities, nil)
+        else
+          callback(nil, loadErr)
+        end
+      end)
+    end)
+  end
+
+  --- Runs an INSERT, UPDATE, DELETE or other statement written by hand and passes the number of affected rows. Values are given with
+  --- ? placeholders like for nativeQuery. Loaded entities are not updated, use refresh or clear afterwards if needed.
+  function nativeExecute(sql: string, params: any = nil, callback: ((number?, string?) -> void)? = nil): void
+    if type(params) == "function" then
+      callback = params
+      params = nil
+    end
+
+    if callback == nil then
+      error("nativeExecute needs a callback, or await it", 2)
+    end
+
+    local ok, expanded, queryParams = pcall(function(): any
+      return self:expandNativeSql(sql, params ?? {})
+    end)
+
+    if not ok then
+      callback(nil, tostring(expanded))
+      return
+    end
+
+    self._connection:execute(expanded, queryParams, callback)
+  end
+
+  local function expandNativeSql(sql: string, values: any): (string, QueryParams)
+    local queryParams = self._connection:createParams()
+    local parts: string[] = {}
+    local count = 0
+    local inString = false
+    local position = 1
+    while position <= #sql do
+      local char = string.sub(sql, position, position)
+      if char == "'" then
+        inString = not inString
+        table.insert(parts, char)
+      elseif char == "?" and not inString and string.sub(sql, position + 1, position + 1) == "?" then
+        table.insert(parts, "?")
+        position = position + 1
+      elseif char == "?" and not inString then
+        count = count + 1
+        table.insert(parts, self:nativeParameter(values[count], queryParams))
+      else
+        table.insert(parts, char)
+      end
+
+      position = position + 1
+    end
+
+    for key, _ in pairs(values) do
+      if math.type(key) ~= "integer" or key > count then
+        error("The native query has " .. count .. " placeholders but more parameters", 0)
+      end
+    end
+
+    return table.concat(parts), queryParams
+  end
+
+  local function nativeParameter(value: any, queryParams: QueryParams): string
+    if type(value) ~= "table" then
+      return queryParams:add(value)
+    end
+
+    local metadata = MetadataRegistry.ofEntity(value)
+    if metadata ~= nil then
+      local idColumn = metadata:getIdColumn()
+      return queryParams:add(self:getPersister(metadata):toDatabaseValue(idColumn, value[idColumn.fieldName]))
+    end
+
+    if getmetatable(value) == nil then
+      if #value == 0 then
+        return "NULL"
+      end
+
+      local placeholders: string[] = {}
+      for _, item in ipairs(value) do
+        table.insert(placeholders, self:nativeParameter(item, queryParams))
+      end
+
+      return table.concat(placeholders, ", ")
+    end
+
+    return queryParams:add(TypeRegistry.toDatabaseValue(value, self._connection:getPlatform()))
+  end
+
+  --- Reloads a managed entity from the database, for example after a version conflict. Its columns and owning relations get the stored
+  --- values and pending changes of them are discarded.
+  function refresh(entity: any, callback: (boolean, string?) -> void): void
+    if not self:contains(entity) or self._insertSet[entity] then
+      callback(false, "Only loaded entities managed by this EntityManager can be refreshed")
+      return
+    end
+
+    self._loader:refresh(self:requireMetadata(entity), entity, callback)
+  end
+
+  --- Runs work in a database transaction, like wrapInTransaction of Doctrine. work receives this EntityManager and a callback, so it can be
+  --- a Nebra async function: await em:transactional(async function(em) ... end). The EntityManager is flushed and the transaction
+  --- committed when work finishes. Returning false or an error text, or raising an error before finishing, rolls it back instead.
+  --- Transactions can be nested, only the outermost one commits. The callback receives whether it was committed, the error and the
+  --- result of work. The timeout of the options, 30 seconds by default and 0 to disable it, rolls back a work that never finishes.
+  --- The options can be left out, so transactional(work, callback) works as well.
+  function transactional(work: any, options: any = nil, callback: ((boolean, string?, any) -> void)? = nil): void
+    if type(options) == "function" then
+      callback = options
+      options = nil
+    end
+
+    local function report(ok: boolean, err: string?, result: any): void
+      if callback ~= nil then
+        callback(ok, err, result)
+      elseif err ~= nil then
+        print("[nanos-orm] transaction failed: " .. err)
+      end
+    end
+
+    self:beginTransaction(options, function(transaction: Transaction?, beginErr: string?): void
+      if transaction == nil then
+        report(false, beginErr, nil)
+        return
+      end
+
+      local done = false
+      transaction:setTimeoutListener(function(err: string): void
+        if not done then
+          done = true
+          report(false, err, nil)
+        end
+      end)
+
+      local function cancel(reason: string): void
+        transaction:rollback(function(_: boolean, rollbackErr: string?): void
+          report(false, rollbackErr ~= nil and (reason .. ", rollback failed: " .. rollbackErr) or reason, nil)
+        end)
+      end
+
+      local function complete(result: any): void
+        if done then
+          return
+        end
+
+        done = true
+        if result == false or type(result) == "string" then
+          cancel(type(result) == "string" and result or "The transaction was cancelled")
+          return
+        end
+
+        transaction:commit(function(committed: boolean, commitErr: string?): void
+          report(committed, commitErr, committed and result or nil)
+        end)
+      end
+
+      local ok, failure = pcall(work, self, complete)
+      if not ok then
+        if done then
+          error(failure, 0)
+        end
+
+        done = true
+        cancel(tostring(failure))
+      end
+    end)
+  end
+
+  --- Starts a transaction on the connection of this EntityManager, like beginTransaction of Doctrine, and passes a Transaction to the
+  --- callback. Everything this EntityManager does until the transaction ends runs inside it. End it with commit or rollback of the
+  --- Transaction. Rolling back an ended Transaction does nothing, so the rollback can be deferred right after the start and only takes
+  --- effect if the commit did not happen:
+  ---
+  ---     local transaction = await em:beginTransaction()
+  ---     defer transaction:rollback()
+  ---     em:persist(player)
+  ---     await transaction:commit()
+  ---
+  --- Transactions can be nested. Only the outermost commit commits, a nested rollback marks the outer transaction for rollback.
+  --- A rollback of the outermost transaction detaches the entities written by flushes inside it and the entities their foreign keys
+  --- point to, because they no longer match the database. All other entities stay managed.
+  --- If the outermost transaction is not ended within the timeout of the options, 30 seconds by default and 0 to disable it, it is
+  --- rolled back. The options can be left out.
+  function beginTransaction(options: any = nil, callback: ((Transaction?, string?) -> void)? = nil): void
+    if type(options) == "function" then
+      callback = options
+      options = nil
+    end
+
+    if callback == nil then
+      error("beginTransaction needs a callback, or await it", 2)
+    end
+
+    if not self._connection:supportsTransactions() then
+      callback(nil, "Transactions need a connection with a pool size of 1")
+      return
+    end
+
+    if self._transactionEnding then
+      table.insert(self._waitingBegins, function(): void
+        self:beginTransaction(options, callback)
+      end)
+
+      return
+    end
+
+    local transaction = new Transaction(self, #self._transactions + 1)
+    table.insert(self._transactions, transaction)
+    if #self._transactions > 1 then
+      callback(transaction, nil)
+      return
+    end
+
+    self._rollbackOnly = false
+    self._transactionGeneration = self._transactionGeneration + 1
+    local generation = self._transactionGeneration
+    local timeout = tonumber(options ~= nil and options.timeout or nil) ?? 30
+    self._connection:execute(self._connection:getPlatform():getBeginTransactionSql(), self._connection:createParams(), function(_: number?, beginErr: string?): void
+      if beginErr ~= nil then
+        self._transactions = {}
+        transaction:finish(beginErr)
+        callback(nil, beginErr)
+        return
+      end
+
+      if timeout > 0 then
+        self._transactionTimer = Timer.SetTimeout(function(): void
+          self._transactionTimer = nil
+          if self._transactionGeneration == generation and #self._transactions > 0 and not self._transactionEnding then
+            self:timeoutTransaction("The transaction timed out after " .. timeout .. " seconds")
+          end
+        end, math.floor(timeout * 1000))
+      end
+
+      callback(transaction, nil)
+    end)
+  end
+
+  --- Commits the innermost transaction started with beginTransaction, see Transaction.commit.
+  function commit(callback: ((boolean, string?) -> void)? = nil): void
+    local transaction = self._transactions[#self._transactions]
+    if transaction == nil then
+      if callback ~= nil then
+        callback(false, "There is no active transaction to commit")
+      end
+
+      return
+    end
+
+    transaction:commit(callback)
+  end
+
+  --- Rolls back the innermost transaction started with beginTransaction, see Transaction.rollback.
+  function rollback(callback: ((boolean, string?) -> void)? = nil): void
+    local transaction = self._transactions[#self._transactions]
+    if transaction == nil then
+      if callback ~= nil then
+        callback(false, "There is no active transaction to roll back")
+      end
+
+      return
+    end
+
+    transaction:rollback(callback)
+  end
+
+  --- Returns whether a transaction is active on this EntityManager.
+  function isTransactionActive(): boolean
+    return #self._transactions > 0
+  end
+
+  --- Returns how many transactions are nested right now, 0 outside of transactions.
+  function getTransactionNestingLevel(): number
+    return #self._transactions
+  end
+
+  --- Returns whether the active transaction was marked to be rolled back by a nested rollback, so its commit fails.
+  function isRollbackOnly(): boolean
+    return self._rollbackOnly
+  end
+
+  --- Ends the given transaction with a commit. Used by Transaction.commit.
+  function commitTransaction(transaction: Transaction, callback: (boolean, string?) -> void): void
+    if self._transactions[#self._transactions] ~= transaction then
+      callback(false, "Nested transactions have to be ended before the transactions around them")
+      return
+    end
+
+    if self._transactionEnding then
+      callback(false, "The transaction is already ending")
+      return
+    end
+
+    if #self._transactions > 1 then
+      self:flush(function(flushed: boolean, flushErr: string?): void
+        if not flushed then
+          self:abortTransaction(flushErr ?? "The flush failed", callback)
+          return
+        end
+
+        table.remove(self._transactions)
+        transaction:finish(nil)
+        callback(true, nil)
+      end)
+
+      return
+    end
+
+    if self._rollbackOnly then
+      self:abortTransaction("The transaction was marked for rollback by a nested transaction", callback)
+      return
+    end
+
+    self._transactionEnding = true
+    self:flush(function(flushed: boolean, flushErr: string?): void
+      if not flushed then
+        self:abortTransaction(flushErr ?? "The flush failed", callback)
+        return
+      end
+
+      self._connection:execute(self._connection:getPlatform():getCommitSql(), self._connection:createParams(), function(_: number?, commitErr: string?): void
+        if commitErr ~= nil then
+          self:abortTransaction(commitErr, callback)
+          return
+        end
+
+        self:endTransaction(nil)
+        self._writtenInTransaction = {}
+        self:releaseWaitingBegins()
+        self:firePendingEvents()
+        callback(true, nil)
+      end)
+    end)
+  end
+
+  --- Ends the given transaction with a rollback. Used by Transaction.rollback.
+  function rollbackTransaction(transaction: Transaction, callback: (boolean, string?) -> void): void
+    if self._transactions[#self._transactions] ~= transaction then
+      callback(false, "Nested transactions have to be ended before the transactions around them")
+      return
+    end
+
+    if #self._transactions > 1 then
+      table.remove(self._transactions)
+      self._rollbackOnly = true
+      transaction:finish("The transaction was rolled back")
+      callback(true, nil)
+      return
+    end
+
+    self:abortTransaction(nil, callback)
+  end
+
+  local function abortTransaction(reason: string?, callback: (boolean, string?) -> void): void
+    self:endTransaction(reason ?? "The transaction was rolled back")
+    self._transactionEnding = true
+    self._pendingEvents = {}
+    self:detachWrittenEntities()
+    self._connection:execute(self._connection:getPlatform():getRollbackSql(), self._connection:createParams(), function(_: number?, rollbackErr: string?): void
+      self:releaseWaitingBegins()
+      if reason ~= nil then
+        callback(false, rollbackErr ~= nil and (reason .. ", rollback failed: " .. rollbackErr) or reason)
+      else
+        callback(rollbackErr == nil, rollbackErr)
+      end
+    end)
+  end
+
+  local function timeoutTransaction(reason: string): void
+    local outermost = self._transactions[1]
+    local listeners: ((string) -> void)[] = {}
+    for _, transaction in ipairs(self._transactions) do
+      local listener = transaction:getTimeoutListener()
+      if listener ~= nil then
+        table.insert(listeners, listener)
+      end
+    end
+
+    self:abortTransaction(reason, function(_: boolean, err: string?): void
+      if #listeners == 0 then
+        print("[nanos-orm] " .. tostring(err))
+      end
+
+      for _, listener in ipairs(listeners) do
+        listener(err ?? reason)
+      end
+    end)
+  end
+
+  local function detachWrittenEntities(): void
+    local written = self._writtenInTransaction
+    self._writtenInTransaction = {}
+    for entity, _ in pairs(written) do
+      if ChangeTracker.isManaged(entity) then
+        self:detach(entity)
+      end
+    end
+  end
+
+  local function rememberWritten(entity: any, changes: { [string]: { old: any, new: any } }?): void
+    self._writtenInTransaction[entity] = true
+    local metadata = MetadataRegistry.ofEntity(entity)
+    if metadata == nil then
+      return
+    end
+
+    local values = ChangeTracker.getValues(entity)
+    for _, relation in ipairs(metadata.relations) do
+      if relation:hasJoinColumn() then
+        local target = values[relation.fieldName] ?? rawget(entity, relation.fieldName)
+        if target ~= nil then
+          self._writtenInTransaction[target] = true
+        end
+
+        local change = changes ~= nil and changes[relation.fieldName] or nil
+        if change ~= nil and change.old ~= nil then
+          self._writtenInTransaction[change.old] = true
+        end
+      end
+    end
+  end
+
+  local function endTransaction(reason: string?): void
+    local timer = self._transactionTimer
+    if timer ~= nil then
+      Timer.ClearTimeout(timer)
+      self._transactionTimer = nil
+    end
+
+    for _, transaction in ipairs(self._transactions) do
+      transaction:finish(reason)
+    end
+
+    self._transactions = {}
+    self._rollbackOnly = false
+  end
+
+  local function releaseWaitingBegins(): void
+    self._transactionEnding = false
+    local waiting = self._waitingBegins
+    self._waitingBegins = {}
+    for _, begin in ipairs(waiting) do
+      begin()
+    end
+  end
+
+  --- Writes all scheduled insertions and removals, all changed columns and owning relations of managed entities and all ManyToMany changes.
+  function flush(callback: ((boolean, string?) -> void)? = nil): void
+    local finished = false
+    local function finish(err: string?): void
+      finished = true
+      self._flushing = false
+      if callback ~= nil then
+        callback(err == nil, err)
+      elseif err ~= nil then
+        print("[nanos-orm] flush failed: " .. err)
+      end
+    end
+
+    if self._flushing then
+      if callback ~= nil then
+        callback(false, "A flush is already running")
+      end
+
+      return
+    end
+
+    self._flushing = true
+    local ok, failure = pcall(function(): void
+      self:runFlush(finish)
+    end)
+
+    if not ok then
+      if finished then
+        error(failure, 0)
+      end
+
+      finish(tostring(failure))
+    end
+  end
+
+  local function expectedVersion(metadata: EntityMetadata, entity: any): number?
+    local versionColumn = metadata.versionColumn
+    if versionColumn == nil then
+      return nil
+    end
+
+    local changes = ChangeTracker.getChanges(entity)
+    local change = changes[versionColumn.fieldName]
+    if change ~= nil then
+      return tonumber(change.old)
+    end
+
+    return tonumber(ChangeTracker.getValues(entity)[versionColumn.fieldName])
+  end
+
+  local function conflictMessage(metadata: EntityMetadata, id: any, action: string): string
+    return "Optimistic lock conflict: the '" .. metadata.className .. "' " .. tostring(id) .. " was changed by someone else and was not " .. action .. ", refresh it and try again"
+  end
+
+  local function dispatch(event: string, entity: any, extra: any): void
+    if FLUSH_EVENTS[event] then
+      for _, subscription in ipairs(self._listeners[event] ?? {}) do
+        subscription.listener(self)
+      end
+
+      return
+    end
+
+    local method = ENTITY_EVENTS[event]
+    if type(entity[method]) == "function" then
+      entity[method](entity)
+    end
+
+    for _, subscription in ipairs(self._listeners[event] ?? {}) do
+      if subscription.entityClass == nil or isInstanceOf(entity, subscription.entityClass) then
+        subscription.listener(entity, self, extra)
+      end
+    end
+  end
+
+  local function dispatchSafely(event: string, entity: any, extra: any): void
+    local ok, failure = pcall(function(): void
+      self:dispatch(event, entity, extra)
+    end)
+
+    if not ok then
+      print("[nanos-orm] " .. event .. " listener failed: " .. tostring(failure))
+    end
+  end
+
+  local function firePendingEvents(): void
+    local events = self._pendingEvents
+    self._pendingEvents = {}
+    for _, pending in ipairs(events) do
+      self:dispatchSafely(pending.event, pending.entity, pending.extra)
+    end
+  end
+
+  local function requireMetadata(target: any): EntityMetadata
+    local metadata = MetadataRegistry.get(target) ?? MetadataRegistry.ofEntity(target)
+    if metadata == nil or metadata.isMappedSuperclass then
+      error("'" .. tostring(target) .. "' is not a mapped entity", 3)
+    end
+
+    return metadata
+  end
+
+  local function unschedule(list: any[], set: { [any]: boolean }, entity: any): void
+    if not set[entity] then
+      return
+    end
+
+    set[entity] = nil
+    for index = #list, 1, -1 do
+      if list[index] == entity then
+        table.remove(list, index)
+      end
+    end
+  end
+
+  local function loadedRelated(entity: any, relation: RelationMetadata): any[]
+    local value = entity[relation.fieldName]
+    if value == nil then
+      return {}
+    end
+
+    if relation:isToOne() then
+      return { value }
+    end
+
+    if not Collection.isCollection(value) then
+      return {}
+    end
+
+    if value:isInitialized() then
+      return value:toArray()
+    end
+
+    local result = value:getInsertions()
+    for _, item in ipairs(value:getPendingAdds()) do
+      table.insert(result, item)
+    end
+
+    return result
+  end
+
+  local function writtenRelated(entity: any, relation: RelationMetadata, isNew: boolean): any[]
+    if isNew then
+      return self:loadedRelated(entity, relation)
+    end
+
+    if relation:isToOne() then
+      if ChangeTracker.isDirty(entity, relation.fieldName) and entity[relation.fieldName] ~= nil then
+        return { entity[relation.fieldName] }
+      end
+
+      return {}
+    end
+
+    local collection = entity[relation.fieldName]
+    if Collection.isCollection(collection) then
+      local result = collection:getInsertions()
+      for _, item in ipairs(collection:getPendingAdds()) do
+        table.insert(result, item)
+      end
+
+      return result
+    end
+
+    return {}
+  end
+
+  local function cascadePersist(entity: any, metadata: EntityMetadata): void
+    for _, relation in ipairs(metadata.relations) do
+      if relation.cascadePersist then
+        for _, related in ipairs(self:loadedRelated(entity, relation)) do
+          if not self:contains(related) then
+            self:persist(related)
+          end
+        end
+      end
+    end
+  end
+
+  local function requireKnownReferences(entity: any, metadata: EntityMetadata): void
+    local isNew = self._insertSet[entity] == true
+    for _, relation in ipairs(metadata.relations) do
+      for _, related in ipairs(self:writtenRelated(entity, relation, isNew)) do
+        if not self:contains(related) then
+          error("'" .. metadata.className .. "." .. relation.fieldName .. "' references a new entity that was not persisted, persist it or use cascade persist", 0)
+        end
+      end
+    end
+  end
+
+  local function orderByDependencies(entities: any[], scheduled: { [any]: boolean }): any[]
+    local result: any[] = {}
+    local state: { [any]: number } = {}
+    local function visit(entity: any): void
+      if state[entity] == 2 then
+        return
+      elseif state[entity] == 1 then
+        error("New entities reference each other in a cycle, assign one of the references after the first flush", 0)
+      end
+
+      state[entity] = 1
+      local metadata = self:requireMetadata(entity)
+      local values = ChangeTracker.getValues(entity)
+      for _, relation in ipairs(metadata.relations) do
+        if relation:hasJoinColumn() then
+          local target = values[relation.fieldName]
+          if target ~= nil and target ~= entity and scheduled[target] then
+            visit(target)
+          end
+        end
+      end
+
+      state[entity] = 2
+      table.insert(result, entity)
+    end
+
+    for _, entity in ipairs(entities) do
+      visit(entity)
+    end
+
+    return result
+  end
+
+  local function orderByLevels(entities: any[]): any[]
+    local ordered = self:orderByDependencies(entities, self._insertSet)
+    local levels: { [any]: number } = {}
+    local position: { [any]: number } = {}
+    local classOrder: { [any]: number } = {}
+    for index, entity in ipairs(ordered) do
+      position[entity] = index
+      local metadata = self:requireMetadata(entity)
+      if classOrder[metadata] == nil then
+        classOrder[metadata] = index
+      end
+
+      local level = 1
+      local values = ChangeTracker.getValues(entity)
+      for _, relation in ipairs(metadata.relations) do
+        if relation:hasJoinColumn() then
+          local target = values[relation.fieldName]
+          if target ~= nil and target ~= entity and levels[target] ~= nil then
+            level = math.max(level, levels[target] + 1)
+          end
+        end
+      end
+
+      levels[entity] = level
+    end
+
+    table.sort(ordered, function(left: any, right: any): boolean
+      if levels[left] ~= levels[right] then
+        return levels[left] < levels[right]
+      end
+
+      local leftClass = classOrder[self:requireMetadata(left)]
+      local rightClass = classOrder[self:requireMetadata(right)]
+      if leftClass ~= rightClass then
+        return leftClass < rightClass
+      end
+
+      return position[left] < position[right]
+    end)
+
+    return ordered
+  end
+
+  local function collectUpdates(): any[]
+    local updates: any[] = {}
+    for _, entity in ipairs(self._loader:getManagedEntities()) do
+      if not self._deleteSet[entity] and ChangeTracker.isInitialized(entity) and ChangeTracker.isDirty(entity) then
+        local metadata = self:requireMetadata(entity)
+        if self:hasWritableChanges(metadata, ChangeTracker.getChanges(entity)) then
+          self:dispatch("preUpdate", entity, ChangeTracker.getChanges(entity))
+          table.insert(updates, { entity = entity, changes = ChangeTracker.getChanges(entity), metadata = metadata })
+        end
+      end
+    end
+
+    return updates
+  end
+
+  local function hasWritableChanges(metadata: EntityMetadata, changes: { [string]: { old: any, new: any } }): boolean
+    for fieldName, _ in pairs(changes) do
+      if metadata:isWritable(fieldName) then
+        return true
+      end
+    end
+
+    return false
+  end
+
+  local function collectCollectionChanges(): any[]
+    local changes: any[] = {}
+    local entities = self._loader:getManagedEntities()
+    for _, entity in ipairs(self._inserts) do
+      table.insert(entities, entity)
+    end
+
+    for _, entity in ipairs(entities) do
+      if not self._deleteSet[entity] then
+        local metadata = self:requireMetadata(entity)
+        for _, relation in ipairs(metadata.relations) do
+          if relation.kind == RelationKind.ManyToMany and relation:isOwningSide() then
+            local collection = entity[relation.fieldName]
+            if Collection.isCollection(collection) and collection:hasPendingChanges() then
+              for _, item in ipairs(collection:getInsertions()) do
+                if not self:contains(item) then
+                  error("'" .. metadata.className .. "." .. relation.fieldName .. "' holds a new entity that was not persisted, persist it or use cascade persist", 0)
+                end
+              end
+
+              table.insert(changes, { entity = entity, relation = relation, collection = collection, metadata = metadata })
+            end
+          end
+        end
+      end
+    end
+
+    return changes
+  end
+
+  local function removeOrphans(): void
+    for _, entity in ipairs(self:collectEntities()) do
+      if ChangeTracker.isInitialized(entity) and not self._deleteSet[entity] then
+        local metadata = self:requireMetadata(entity)
+        for _, relation in ipairs(metadata.relations) do
+          if relation.orphanRemoval then
+            local orphans: any[] = {}
+            if relation.kind == RelationKind.OneToMany then
+              local collection = entity[relation.fieldName]
+              if Collection.isCollection(collection) then
+                local mappedField = relation:getMappedRelation().fieldName
+                for _, orphan in ipairs(collection:takeOrphans()) do
+                  local owner = orphan[mappedField]
+                  if owner == nil or owner == entity then
+                    table.insert(orphans, orphan)
+                  end
+                end
+              end
+            else
+              local change = ChangeTracker.getChanges(entity)[relation.fieldName]
+              if change ~= nil and change.old ~= nil and change.old ~= change.new then
+                table.insert(orphans, change.old)
+              end
+            end
+
+            for _, orphan in ipairs(orphans) do
+              if self:contains(orphan) and not self._deleteSet[orphan] then
+                self:remove(orphan)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local function collectEntities(): any[]
+    local entities = self._loader:getManagedEntities()
+    for _, entity in ipairs(self._inserts) do
+      table.insert(entities, entity)
+    end
+
+    return entities
+  end
+
+  local function prepareFlush(): void
+    for _, entity in ipairs(self:collectEntities()) do
+      if ChangeTracker.isInitialized(entity) then
+        self:cascadePersist(entity, self:requireMetadata(entity))
+      end
+    end
+
+    self:removeOrphans()
+
+    for _, entity in ipairs(self:collectEntities()) do
+      if ChangeTracker.isInitialized(entity) and not self._deleteSet[entity] then
+        self:requireKnownReferences(entity, self:requireMetadata(entity))
+      end
+    end
+  end
+
+  local async function runFlush(): string?
+    self:dispatch("preFlush", nil, nil)
+    self:prepareFlush()
+
+    local inserts = self:orderByLevels(self._inserts)
+    local updates = self:collectUpdates()
+    local collectionChanges = self:collectCollectionChanges()
+    local deleteOrder = self:orderByDependencies(self._deletes, self._deleteSet)
+    local deletes: any[] = {}
+    for index = #deleteOrder, 1, -1 do
+      table.insert(deletes, deleteOrder[index])
+    end
+
+    if #inserts == 0 and #updates == 0 and #collectionChanges == 0 and #deletes == 0 then
+      return nil
+    end
+
+    local platform = self._connection:getPlatform()
+    local transactional = self._connection:supportsTransactions() and #self._transactions == 0
+    if transactional then
+      local _, beginErr = await self._connection:execute(platform:getBeginTransactionSql(), self._connection:createParams())
+      if beginErr ~= nil then
+        return beginErr
+      end
+    end
+
+    local generated: any[] = {}
+    local err = await self:writeChanges(inserts, updates, collectionChanges, deletes, generated)
+    if err ~= nil then
+      if transactional then
+        await self._connection:execute(platform:getRollbackSql(), self._connection:createParams())
+      end
+
+      for _, entity in ipairs(generated) do
+        ChangeTracker.setClean(entity, self:requireMetadata(entity):getIdColumn().fieldName, nil)
+      end
+
+      return err
+    end
+
+    if transactional then
+      local _, commitErr = await self._connection:execute(platform:getCommitSql(), self._connection:createParams())
+      if commitErr ~= nil then
+        return commitErr
+      end
+    end
+
+    self:completeFlush(inserts, updates, collectionChanges, deletes)
+    for _, entity in ipairs(inserts) do
+      table.insert(self._pendingEvents, { event = "postPersist", entity = entity })
+    end
+
+    for _, update in ipairs(updates) do
+      table.insert(self._pendingEvents, { event = "postUpdate", entity = update.entity, extra = update.changes })
+    end
+
+    for _, entity in ipairs(deletes) do
+      table.insert(self._pendingEvents, { event = "postRemove", entity = entity })
+    end
+
+    if #self._transactions == 0 then
+      self:firePendingEvents()
+    end
+
+    self:dispatchSafely("postFlush", nil, nil)
+    return nil
+  end
+
+  local function protectBuild(build: () -> any): (string, any, string?)
+    local ok, sql, params = pcall(build)
+    if not ok then
+      return "", nil, tostring(sql)
+    end
+
+    return sql, params, nil
+  end
+
+  local async function writeChanges(inserts: any[], updates: any[], collectionChanges: any[], deletes: any[], generated: any[]): string?
+    local platform = self._connection:getPlatform()
+    local index = 1
+    while index <= #inserts do
+      local entity = inserts[index]
+      local metadata = self:requireMetadata(entity)
+      local persister = self:getPersister(metadata)
+      local idColumn = metadata:getIdColumn()
+      local values = ChangeTracker.getValues(entity)
+      local batch: { [string]: any }[] = {}
+      if values[idColumn.fieldName] ~= nil then
+        local limit = persister:getBatchSize()
+        local next = index
+        while next <= #inserts and #batch < limit do
+          local candidate = inserts[next]
+          local candidateValues = ChangeTracker.getValues(candidate)
+          if self:requireMetadata(candidate) ~= metadata or candidateValues[idColumn.fieldName] == nil then
+            break
+          end
+
+          table.insert(batch, candidateValues)
+          next = next + 1
+        end
+      end
+
+      if #batch > 1 then
+        local sql, params, buildErr = self:protectBuild(function(): any
+          return persister:buildInsertBatch(batch)
+        end)
+
+        if buildErr ~= nil then
+          return buildErr
+        end
+
+        local _, batchErr = await self._connection:execute(sql, params)
+        if batchErr ~= nil then
+          return batchErr
+        end
+
+        index = index + #batch
+        continue
+      end
+
+      index = index + 1
+      local sql, params, buildErr = self:protectBuild(function(): any
+        return persister:buildInsert(values)
+      end)
+
+      if buildErr ~= nil then
+        return buildErr
+      end
+
+      if persister:hasIncrementId() and values[idColumn.fieldName] == nil then
+        local rawId: any = nil
+        if not platform:supportsReturning() then
+          local _, insertErr = await self._connection:execute(sql, params)
+          if insertErr ~= nil then
+            return insertErr
+          end
+
+          local rows, idErr = await self._connection:select(platform:getLastInsertIdSql(), self._connection:createParams())
+          if rows == nil then
+            return idErr
+          end
+
+          rawId = rows[1] ~= nil and rows[1].id or nil
+        else
+          local rows, insertErr = await self._connection:select(sql, params)
+          if rows == nil then
+            return insertErr
+          end
+
+          rawId = rows[1] ~= nil and rows[1][idColumn.columnName] or nil
+        end
+
+        if rawId == nil then
+          return "The database returned no id for the new '" .. metadata.className .. "'"
+        end
+
+        ChangeTracker.setClean(entity, idColumn.fieldName, persister:normalizeId(rawId))
+        table.insert(generated, entity)
+      else
+        local _, insertErr = await self._connection:execute(sql, params)
+        if insertErr ~= nil then
+          return insertErr
+        end
+      end
+    end
+
+    for _, update in ipairs(updates) do
+      local metadata = update.metadata as EntityMetadata
+      local persister = self:getPersister(metadata)
+      local values = ChangeTracker.getValues(update.entity)
+      local id = values[metadata:getIdColumn().fieldName]
+      local expectedVersion = self:expectedVersion(metadata, update.entity)
+      local sql, params, buildErr = self:protectBuild(function(): any
+        return persister:buildUpdate(update.changes, id, expectedVersion)
+      end)
+
+      if buildErr ~= nil then
+        return buildErr
+      end
+
+      if sql ~= "" then
+        local affected, updateErr = await self._connection:execute(sql, params)
+        if updateErr ~= nil then
+          return updateErr
+        end
+
+        if expectedVersion ~= nil then
+          if affected == 0 then
+            return self:conflictMessage(metadata, id, "updated")
+          end
+
+          update.newVersion = expectedVersion + 1
+        end
+      end
+    end
+
+    for _, change in ipairs(collectionChanges) do
+      local metadata = change.metadata as EntityMetadata
+      local relation = change.relation as RelationMetadata
+      local persister = self:getPersister(metadata)
+      local ownerId = change.entity[metadata:getIdColumn().fieldName]
+      local targetIdField = relation:getTarget():getIdColumn().fieldName
+      local statements: any[] = {}
+      if change.collection:isCleared() then
+        local sql, params, buildErr = self:protectBuild(function(): any
+          return persister:buildJoinTableDelete(relation, ownerId, nil)
+        end)
+
+        if buildErr ~= nil then
+          return buildErr
+        end
+
+        table.insert(statements, { sql = sql, params = params })
+      end
+
+      for _, item in ipairs(change.collection:getDeletions()) do
+        local sql, params, buildErr = self:protectBuild(function(): any
+          return persister:buildJoinTableDelete(relation, ownerId, item[targetIdField])
+        end)
+
+        if buildErr ~= nil then
+          return buildErr
+        end
+
+        table.insert(statements, { sql = sql, params = params })
+      end
+
+      for _, item in ipairs(change.collection:getInsertions()) do
+        local sql, params, buildErr = self:protectBuild(function(): any
+          return persister:buildJoinTableInsert(relation, ownerId, item[targetIdField])
+        end)
+
+        if buildErr ~= nil then
+          return buildErr
+        end
+
+        table.insert(statements, { sql = sql, params = params })
+      end
+
+      for _, statement in ipairs(statements) do
+        local _, statementErr = await self._connection:execute(statement.sql, statement.params)
+        if statementErr ~= nil then
+          return statementErr
+        end
+      end
+    end
+
+    for _, entity in ipairs(deletes) do
+      local metadata = self:requireMetadata(entity)
+      local persister = self:getPersister(metadata)
+      local id = ChangeTracker.getValues(entity)[metadata:getIdColumn().fieldName]
+      local expectedVersion = self:expectedVersion(metadata, entity)
+      local sql, params, buildErr = self:protectBuild(function(): any
+        return persister:buildDelete(id, expectedVersion)
+      end)
+
+      if buildErr ~= nil then
+        return buildErr
+      end
+
+      local affected, deleteErr = await self._connection:execute(sql, params)
+      if deleteErr ~= nil then
+        return deleteErr
+      end
+
+      if expectedVersion ~= nil and affected == 0 then
+        return self:conflictMessage(metadata, id, "deleted")
+      end
+    end
+
+    return nil
+  end
+
+  local function applyDatabaseDeletes(deletes: any[]): void
+    local queue: any[] = {}
+    for _, entity in ipairs(deletes) do
+      table.insert(queue, entity)
+    end
+
+    local index = 1
+    while index <= #queue do
+      local deleted = queue[index]
+      index = index + 1
+      for _, entity in ipairs(self._loader:getManagedEntities()) do
+        local metadata = self:requireMetadata(entity)
+        for _, relation in ipairs(metadata.relations) do
+          if relation:hasJoinColumn() and ChangeTracker.getValues(entity)[relation.fieldName] == deleted and self:contains(entity) then
+            if relation.onDelete == "CASCADE" then
+              table.insert(queue, entity)
+              self:detach(entity)
+            elseif relation.onDelete == "SET NULL" then
+              ChangeTracker.setClean(entity, relation.fieldName, nil)
+              if #self._transactions > 0 then
+                self._writtenInTransaction[entity] = true
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local function completeFlush(inserts: any[], updates: any[], collectionChanges: any[], deletes: any[]): void
+    if #self._transactions > 0 then
+      for _, entity in ipairs(inserts) do
+        self:rememberWritten(entity, nil)
+      end
+
+      for _, update in ipairs(updates) do
+        self:rememberWritten(update.entity, update.changes)
+      end
+
+      for _, change in ipairs(collectionChanges) do
+        self._writtenInTransaction[change.entity] = true
+      end
+
+      for _, entity in ipairs(deletes) do
+        self:rememberWritten(entity, nil)
+      end
+    end
+
+    for _, entity in ipairs(inserts) do
+      ChangeTracker.markClean(entity)
+      self._loader:register(self:requireMetadata(entity), entity)
+      self._insertSet[entity] = nil
+    end
+
+    for _, update in ipairs(updates) do
+      local versionColumn = (update.metadata as EntityMetadata).versionColumn
+      if versionColumn ~= nil and update.newVersion ~= nil then
+        ChangeTracker.setClean(update.entity, versionColumn.fieldName, update.newVersion)
+      end
+
+      ChangeTracker.markClean(update.entity)
+    end
+
+    for _, change in ipairs(collectionChanges) do
+      change.collection:commit()
+    end
+
+    for _, entity in ipairs(deletes) do
+      self:detach(entity)
+    end
+
+    self:applyDatabaseDeletes(deletes)
+    local remaining: any[] = {}
+    for _, entity in ipairs(self._inserts) do
+      if self._insertSet[entity] then
+        table.insert(remaining, entity)
+      end
+    end
+
+    self._inserts = remaining
+    for _, entity in ipairs(self._loader:getManagedEntities()) do
+      for _, relation in ipairs(self:requireMetadata(entity).relations) do
+        if relation:isToMany() then
+          local collection = ChangeTracker.getValues(entity)[relation.fieldName]
+          if Collection.isCollection(collection) then
+            collection:forgetPendingAdds()
+          end
+        end
+      end
+
+      if not ChangeTracker.isDirty(entity) then
+        self._loader:unpin(entity)
+      end
+    end
+  end
+end
+
+--- A transaction started with EntityManager.beginTransaction. Ending it a second time does nothing, so its rollback can be deferred.
+export class Transaction
+
+  local _entityManager: EntityManager
+  local _level: number
+  local _active: boolean = true
+  local _endReason: string? = nil
+  local _timeoutListener: ((string) -> void)? = nil
+
+  constructor(entityManager: EntityManager, level: number)
+    self._entityManager = entityManager
+    self._level = level
+  end
+
+  --- Returns the EntityManager the transaction runs on.
+  function getEntityManager(): EntityManager
+    return self._entityManager
+  end
+
+  --- Returns the nesting level, 1 for the outermost transaction.
+  function getLevel(): number
+    return self._level
+  end
+
+  --- Returns whether the transaction was neither committed nor rolled back yet.
+  function isActive(): boolean
+    return self._active
+  end
+
+  --- Flushes the EntityManager and commits. Nested transactions only end their level, the outermost one commits to the database.
+  --- If the flush or the commit fails, or a nested transaction was rolled back, everything is rolled back and the callback gets the error.
+  function commit(callback: ((boolean, string?) -> void)? = nil): void
+    local function report(ok: boolean, err: string?): void
+      if callback ~= nil then
+        callback(ok, err)
+      elseif err ~= nil then
+        print("[nanos-orm] commit failed: " .. err)
+      end
+    end
+
+    if not self._active then
+      report(false, self._endReason ?? "The transaction has already ended")
+      return
+    end
+
+    self._entityManager:commitTransaction(self, report)
+  end
+
+  --- Rolls back the transaction. Does nothing if it has already ended, so it can be deferred.
+  function rollback(callback: ((boolean, string?) -> void)? = nil): void
+    if not self._active then
+      if callback ~= nil then
+        callback(true, nil)
+      end
+
+      return
+    end
+
+    self._entityManager:rollbackTransaction(self, function(ok: boolean, err: string?): void
+      if callback ~= nil then
+        callback(ok, err)
+      elseif err ~= nil then
+        print("[nanos-orm] rollback failed: " .. err)
+      end
+    end)
+  end
+
+  --- Sets the function called when the transaction is rolled back because of its timeout. Used by EntityManager.transactional.
+  function setTimeoutListener(listener: ((string) -> void)?): void
+    self._timeoutListener = listener
+  end
+
+  --- Returns the function called when the transaction times out.
+  function getTimeoutListener(): ((string) -> void)?
+    return self._timeoutListener
+  end
+
+  --- Marks the transaction as ended. A reason is reported by a later commit. Used by the EntityManager.
+  function finish(reason: string?): void
+    if self._active then
+      self._active = false
+      self._endReason = reason
+    end
+  end
+end

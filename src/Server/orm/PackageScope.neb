@@ -1,0 +1,29 @@
+local packageApi: any = Package
+local ownPackage: string? = nil
+if type(packageApi) == "table" and type(packageApi.GetName) == "function" then
+  ownPackage = packageApi.GetName()
+end
+
+--- Returns the nanos world package of the code calling into the ORM. It is read from the source of the first stack frame outside of
+--- the ORM package, which starts with the folder of its package, like "my-gamemode/Server/Index.lua". Returns nil outside of nanos world.
+export function getCallingPackage(): string?
+  if ownPackage == nil then
+    return nil
+  end
+
+  local level = 2
+  while true do
+    local info = debug.getinfo(level, "S")
+    if info == nil then
+      return nil
+    end
+
+    local source = string.gsub(tostring(info.source), "^@", "")
+    local name = string.match(source, "^([%w%-_%.]+)[/\\]")
+    if name ~= nil and name ~= ownPackage then
+      return name
+    end
+
+    level = level + 1
+  end
+end

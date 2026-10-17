@@ -1,0 +1,120 @@
+import { ColumnType } from "../ColumnType"
+import { Platform } from "../../dbal/Platform"
+
+--- A string column with a maximum length.
+export class StringColumn implements ColumnType<string>
+
+  local _length: number = 255
+
+  constructor(length: number = 255)
+    self._length = length
+  end
+
+  function getSqlType(platform: Platform): string
+    return platform:getStringType(self._length)
+  end
+
+  function toDatabase(value: string, platform: Platform): any
+    return value
+  end
+
+  function fromDatabase(raw: any, platform: Platform): string?
+    if raw == nil then
+      return nil
+    end
+
+    return tostring(raw)
+  end
+end
+
+--- A string column without a length limit.
+export class TextColumn implements ColumnType<string>
+
+  function getSqlType(platform: Platform): string
+    return platform:getTextType()
+  end
+
+  function toDatabase(value: string, platform: Platform): any
+    return value
+  end
+
+  function fromDatabase(raw: any, platform: Platform): string?
+    if raw == nil then
+      return nil
+    end
+
+    return tostring(raw)
+  end
+end
+
+--- A whole number column. Big columns use BIGINT.
+export class IntegerColumn implements ColumnType<number>
+
+  local _big: boolean = false
+
+  constructor(big: boolean = false)
+    self._big = big
+  end
+
+  function getSqlType(platform: Platform): string
+    return self._big and platform:getBigIntType() or platform:getIntegerType()
+  end
+
+  function toDatabase(value: number, platform: Platform): any
+    return math.tointeger(value) ?? math.floor(value)
+  end
+
+  function fromDatabase(raw: any, platform: Platform): number?
+    local value = tonumber(raw)
+    if value == nil then
+      return nil
+    end
+
+    return math.tointeger(value) ?? math.floor(value)
+  end
+end
+
+--- A floating point number column.
+export class NumberColumn implements ColumnType<number>
+
+  function getSqlType(platform: Platform): string
+    return platform:getFloatType()
+  end
+
+  function toDatabase(value: number, platform: Platform): any
+    return value
+  end
+
+  function fromDatabase(raw: any, platform: Platform): number?
+    return tonumber(raw)
+  end
+end
+
+--- A boolean column. The platform decides whether it is stored as boolean or as 0 and 1.
+export class BooleanColumn implements ColumnType<boolean>
+
+  function getSqlType(platform: Platform): string
+    return platform:getBooleanType()
+  end
+
+  function toDatabase(value: boolean, platform: Platform): any
+    return platform:convertBooleanToDatabase(value)
+  end
+
+  function fromDatabase(raw: any, platform: Platform): boolean?
+    if raw == nil then
+      return nil
+    elseif raw == true or raw == false then
+      return raw as boolean
+    end
+
+    local text = string.lower(tostring(raw))
+    if text == "1" or text == "t" or text == "true" then
+      return true
+    elseif text == "0" or text == "f" or text == "false" then
+      return false
+    end
+
+    return nil
+  end
+end

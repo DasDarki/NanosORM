@@ -1,0 +1,336 @@
+import { Decimal, RoundingMode } from "./Decimal"
+
+--- A currency with its code, the amount of minor unit digits and a symbol used for formatting.
+--- Games can register their own currencies, for example new Currency("GOLD", 0, "G", false).
+export class Currency
+
+  local static _registry: { [string]: Currency } = {}
+
+  --- The US dollar.
+  static USD: Currency = new Currency("USD", 2, "$", true)
+
+  --- The euro.
+  static EUR: Currency = new Currency("EUR", 2, "€", false)
+
+  --- The british pound.
+  static GBP: Currency = new Currency("GBP", 2, "£", true)
+
+  --- The swiss franc.
+  static CHF: Currency = new Currency("CHF", 2, "CHF", false)
+
+  --- The japanese yen.
+  static JPY: Currency = new Currency("JPY", 0, "¥", true)
+
+  local static _default: Currency = Currency.USD
+
+  local _code: string = ""
+  local _scale: number = 2
+  local _symbol: string = ""
+  local _symbolFirst: boolean = true
+
+  --- Creates a currency and registers it, so it can be resolved with Currency.of.
+  constructor(code: string, scale: number = 2, symbol: string? = nil, symbolFirst: boolean = true)
+    self._code = string.upper(code)
+    self._scale = scale
+    self._symbol = symbol ?? self._code
+    self._symbolFirst = symbolFirst
+    Currency._registry[self._code] = self
+  end
+
+  --- Resolves a registered currency by its code.
+  static function of(code: string): Currency?
+    return Currency._registry[string.upper(code)]
+  end
+
+  --- Returns the currency used when no currency is given explicitly. Defaults to USD.
+  static function getDefault(): Currency
+    return Currency._default
+  end
+
+  --- Sets the currency used when no currency is given explicitly.
+  static function setDefault(currency: Currency): void
+    Currency._default = currency
+  end
+
+  --- Returns the currency code, for example "EUR".
+  function getCode(): string
+    return self._code
+  end
+
+  --- Returns the amount of digits of the minor unit, for example 2 for cents.
+  function getScale(): number
+    return self._scale
+  end
+
+  --- Returns the symbol, for example "€".
+  function getSymbol(): string
+    return self._symbol
+  end
+
+  --- Returns whether the symbol is written in front of the amount.
+  function isSymbolFirst(): boolean
+    return self._symbolFirst
+  end
+
+  --- Returns whether both currencies have the same code.
+  function equals(other: Currency): boolean
+    return self._code == other:getCode()
+  end
+
+  function __tostring(): string
+    return self._code
+  end
+end
+
+local function groupDigits(digits: string, separator: string): string
+  local grouped = string.reverse((string.gsub(string.reverse(digits), "(%d%d%d)", "%1" .. separator)))
+  if string.sub(grouped, 1, #separator) == separator then
+    grouped = string.sub(grouped, #separator + 1)
+  end
+
+  return grouped
+end
+
+--- An immutable amount of money in a currency. The amount always has exactly the scale of the currency.
+export class Money
+
+  local _amount: Decimal = Decimal.ZERO
+  local _currency: Currency = Currency.USD
+
+  --- Creates an amount of money. The amount is rounded half up to the scale of the currency, which defaults to Currency.getDefault().
+  constructor(amount: Decimal | number | string, currency: Currency? = nil)
+    self._currency = currency ?? Currency.getDefault()
+    self._amount = Decimal.of(amount):setScale(self._currency:getScale(), RoundingMode.HalfUp)
+  end
+
+  --- Creates an amount of money.
+  static function of(amount: Decimal | number | string, currency: Currency? = nil): Money
+    return new Money(amount, currency)
+  end
+
+  --- Creates an amount of money from minor units, so Money.ofMinor(1234, Currency.EUR) is 12.34 EUR.
+  static function ofMinor(minorUnits: number, currency: Currency? = nil): Money
+    local resolved = currency ?? Currency.getDefault()
+    return new Money(new Decimal(minorUnits, resolved:getScale()), resolved)
+  end
+
+  --- Returns zero in the given currency.
+  static function zero(currency: Currency? = nil): Money
+    return Money.ofMinor(0, currency)
+  end
+
+  --- Returns the sum of all given amounts, which have to share the same currency.
+  static function sum(amounts: Money[], currency: Currency? = nil): Money
+    local result = Money.zero(currency ?? (amounts[1] ~= nil and amounts[1]:getCurrency() or nil))
+    for index = 1, #amounts do
+      result = result:plus(amounts[index])
+    end
+
+    return result
+  end
+
+  local function requireSameCurrency(other: Money): void
+    if not self._currency:equals(other:getCurrency()) then
+      error("Currency mismatch: " .. self._currency:getCode() .. " and " .. other:getCurrency():getCode(), 3)
+    end
+  end
+
+  --- Returns the amount as a decimal.
+  function getAmount(): Decimal
+    return self._amount
+  end
+
+  --- Returns the currency.
+  function getCurrency(): Currency
+    return self._currency
+  end
+
+  --- Returns the amount in minor units, for example cents.
+  function getMinorUnits(): number
+    return self._amount:getUnscaled()
+  end
+
+  --- Returns the sum of both amounts. Both have to share the same currency.
+  function plus(other: Money): Money
+    self:requireSameCurrency(other)
+    return new Money(self._amount:plus(other:getAmount()), self._currency)
+  end
+
+  --- Returns the difference of both amounts. Both have to share the same currency.
+  function minus(other: Money): Money
+    self:requireSameCurrency(other)
+    return new Money(self._amount:minus(other:getAmount()), self._currency)
+  end
+
+  --- Returns the amount multiplied by the given factor, rounded with the given mode.
+  function multiply(factor: Decimal | number | string, mode: RoundingMode = RoundingMode.HalfUp): Money
+    local product = self._amount:multiply(factor):setScale(self._currency:getScale(), mode)
+    return new Money(product, self._currency)
+  end
+
+  --- Returns the amount divided by the given divisor, rounded with the given mode. Use allocate or split to divide without losing minor units.
+  function divide(divisor: Decimal | number | string, mode: RoundingMode = RoundingMode.HalfUp): Money
+    return new Money(self._amount:divide(divisor, self._currency:getScale(), mode), self._currency)
+  end
+
+  --- Returns the given percentage of this amount, so percentage(19) is 19 percent.
+  function percentage(percent: Decimal | number | string, mode: RoundingMode = RoundingMode.HalfUp): Money
+    local factor = Decimal.of(percent):divide(100, 12)
+    return self:multiply(factor, mode)
+  end
+
+  --- Splits this amount by the given ratios without losing minor units. Leftover minor units go to the first parts.
+  --- For example 100.00 allocated by { 1, 1, 1 } results in 33.34, 33.33 and 33.33.
+  function allocate(ratios: number[]): Money[]
+    local total = 0
+    for index = 1, #ratios do
+      if ratios[index] < 0 then
+        error("Ratios must not be negative", 2)
+      end
+
+      total = total + ratios[index]
+    end
+
+    if total <= 0 then
+      error("At least one ratio has to be positive", 2)
+    end
+
+    local minorUnits = self:getMinorUnits()
+    local absolute = math.abs(minorUnits)
+    local sign = minorUnits < 0 and -1 or 1
+    local shares: number[] = {}
+    local remaining = absolute
+    for index = 1, #ratios do
+      local share = math.floor(absolute * ratios[index] / total)
+      shares[index] = share
+      remaining = remaining - share
+    end
+
+    local index = 1
+    while remaining > 0 do
+      if ratios[index] > 0 then
+        shares[index] = shares[index] + 1
+        remaining = remaining - 1
+      end
+
+      index = index % #ratios + 1
+    end
+
+    local result: Money[] = {}
+    for position = 1, #shares do
+      result[position] = Money.ofMinor(sign * shares[position], self._currency)
+    end
+
+    return result
+  end
+
+  --- Splits this amount into the given amount of equal parts without losing minor units.
+  function split(parts: number): Money[]
+    if parts < 1 then
+      error("Parts must be at least 1", 2)
+    end
+
+    local ratios: number[] = {}
+    for index = 1, parts do
+      ratios[index] = 1
+    end
+
+    return self:allocate(ratios)
+  end
+
+  --- Returns the negated amount.
+  function negate(): Money
+    return new Money(self._amount:negate(), self._currency)
+  end
+
+  --- Returns the absolute amount.
+  function abs(): Money
+    return self._amount:isNegative() and self:negate() or self
+  end
+
+  --- Returns whether the amount is zero.
+  function isZero(): boolean
+    return self._amount:isZero()
+  end
+
+  --- Returns whether the amount is above zero.
+  function isPositive(): boolean
+    return self._amount:isPositive()
+  end
+
+  --- Returns whether the amount is below zero.
+  function isNegative(): boolean
+    return self._amount:isNegative()
+  end
+
+  --- Returns -1, 0 or 1 depending on whether this amount is smaller, equal or larger than the other. Both have to share the same currency.
+  function compareTo(other: Money): number
+    self:requireSameCurrency(other)
+    return self._amount:compareTo(other:getAmount())
+  end
+
+  --- Returns whether both amounts have the same value and currency.
+  function equals(other: Money): boolean
+    return self._currency:equals(other:getCurrency()) and self._amount:equals(other:getAmount())
+  end
+
+  --- Returns whether this amount is larger than the other.
+  function isGreaterThan(other: Money): boolean
+    return self:compareTo(other) > 0
+  end
+
+  --- Returns whether this amount is smaller than the other.
+  function isLessThan(other: Money): boolean
+    return self:compareTo(other) < 0
+  end
+
+  --- Formats the amount with the currency symbol, for example "$1,234.56" or "1.234,56 €" with format(".", ",").
+  function format(thousandsSeparator: string = ",", decimalSeparator: string = "."): string
+    local plain = self._amount:abs():toString()
+    local integerPart, fractionPart = string.match(plain, "^(%d+)%.?(%d*)$")
+    local number = groupDigits(integerPart ?? plain, thousandsSeparator)
+    if fractionPart ~= nil and fractionPart ~= "" then
+      number = number .. decimalSeparator .. fractionPart
+    end
+
+    local sign = self._amount:isNegative() and "-" or ""
+    if self._currency:isSymbolFirst() then
+      return sign .. self._currency:getSymbol() .. number
+    end
+
+    return sign .. number .. " " .. self._currency:getSymbol()
+  end
+
+  --- Returns the amount with the currency code, for example "12.34 EUR".
+  function toString(): string
+    return self._amount:toString() .. " " .. self._currency:getCode()
+  end
+
+  function __tostring(): string
+    return self:toString()
+  end
+
+  operator +(other: Money): Money
+    return self:plus(other)
+  end
+
+  operator -(other: Money): Money
+    return self:minus(other)
+  end
+
+  operator -(): Money
+    return self:negate()
+  end
+
+  operator ==(other: Money): boolean
+    return self:equals(other)
+  end
+
+  operator <(other: Money): boolean
+    return self:compareTo(other) < 0
+  end
+
+  operator <=(other: Money): boolean
+    return self:compareTo(other) <= 0
+  end
+end

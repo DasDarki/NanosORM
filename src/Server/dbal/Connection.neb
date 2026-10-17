@@ -1,0 +1,220 @@
+import { Driver, NanosDriver } from "./Driver"
+import { Platform, createPlatform } from "./Platform"
+
+--- Collects query parameters and renders the placeholders of the driver. Nil values are written as NULL instead of a placeholder.
+export class QueryParams
+
+  local _driver: Driver
+  local _values: any[] = {}
+
+  constructor(driver: Driver)
+    self._driver = driver
+  end
+
+  --- Adds a value and returns the SQL to reference it.
+  function add(value: any): string
+    if value == nil then
+      return "NULL"
+    end
+
+    table.insert(self._values, value)
+    return self._driver:getPlaceholder(#self._values - 1)
+  end
+
+  --- Returns the collected values in placeholder order.
+  function getValues(): any[]
+    return self._values
+  end
+end
+
+--- Combines a driver, which runs the queries, with a platform, which describes the SQL dialect.
+--- Results are passed to callbacks as (result, error), so they can be awaited in Nebra: local rows, err = await connection:select(sql, params)
+export class Connection
+
+  local _driver: Driver
+  local _platform: Platform
+  local _logging: boolean = false
+  local _initialized: boolean = false
+  local _waiting: any[] = {}
+  local _parent: Connection? = nil
+  local _locked: boolean = false
+  local _released: boolean = false
+  local _queue: any[] = {}
+
+  constructor(driver: Driver, platform: Platform)
+    self._driver = driver
+    self._platform = platform
+  end
+
+  --- Opens a connection with the nanos world Database class and the platform of the given engine.
+  static function create(engine: DatabaseEngine, connectionString: string, poolSize: number = 1): Connection
+    return new Connection(new NanosDriver(engine, connectionString, poolSize), createPlatform(engine))
+  end
+
+  --- Returns the driver.
+  function getDriver(): Driver
+    return self._driver
+  end
+
+  --- Returns the platform.
+  function getPlatform(): Platform
+    return self._platform
+  end
+
+  --- Returns whether statements can be grouped into transactions.
+  function supportsTransactions(): boolean
+    return self._driver:supportsTransactions()
+  end
+
+  --- Enables or disables printing every query.
+  function setLogging(enabled: boolean): void
+    self._logging = enabled
+  end
+
+  --- Creates an empty parameter list for a query.
+  function createParams(): QueryParams
+    return new QueryParams(self._driver)
+  end
+
+  --- Quotes a table or column name for the platform.
+  function quote(identifier: string): string
+    return self._platform:quoteIdentifier(identifier)
+  end
+
+  --- Gives the callback an exclusive view of this connection, for example for a transaction. While a view is held, queries of this
+  --- connection wait in a queue, so statements of other callers cannot end up inside the transaction. Release the view when done.
+  --- Requests made while another view is held wait for it as well.
+  function acquire(callback: (Connection) -> void): void
+    if self._parent ~= nil then
+      error("An exclusive view cannot be acquired from another view", 2)
+    end
+
+    self:dispatch(function(): void
+      self._locked = true
+      local view = new Connection(self._driver, self._platform)
+      view._parent = self
+      view._initialized = true
+      view._logging = self._logging
+      callback(view)
+    end)
+  end
+
+  --- Releases an exclusive view and runs the queries that waited for it.
+  function release(): void
+    local parent = self._parent
+    if parent == nil then
+      error("Only an exclusive view can be released", 2)
+    end
+
+    self._parent = nil
+    self._released = true
+    parent:unlock()
+  end
+
+  --- Returns whether an exclusive view of this connection is held.
+  function isLocked(): boolean
+    return self._locked
+  end
+
+  --- Runs a query that returns rows. The callback receives the rows or an error.
+  function select(sql: string, params: QueryParams, callback: (any[]?, string?) -> void): void
+    if self._released then
+      callback(nil, "This exclusive view was released, its transaction is over")
+      return
+    end
+
+    self:dispatch(function(): void
+      local values = params:getValues()
+      self:log(sql, values)
+      self._driver:select(sql, values, callback)
+    end)
+  end
+
+  --- Runs a statement. The callback receives the number of affected rows or an error.
+  function execute(sql: string, params: QueryParams, callback: (number?, string?) -> void): void
+    if self._released then
+      callback(nil, "This exclusive view was released, its transaction is over")
+      return
+    end
+
+    self:dispatch(function(): void
+      local values = params:getValues()
+      self:log(sql, values)
+      self._driver:execute(sql, values, callback)
+    end)
+  end
+
+  --- Closes the driver.
+  function close(): void
+    self._driver:close()
+  end
+
+  local function unlock(): void
+    self._locked = false
+    while #self._queue > 0 and not self._locked do
+      local action = table.remove(self._queue, 1)
+      action()
+    end
+  end
+
+  local function dispatch(action: () -> void): void
+    if self._locked then
+      table.insert(self._queue, action)
+      return
+    end
+
+    self:whenReady(action)
+  end
+
+  local function whenReady(action: () -> void): void
+    if self._initialized then
+      action()
+      return
+    end
+
+    table.insert(self._waiting, action)
+    if #self._waiting > 1 then
+      return
+    end
+
+    local statements = self._platform:getConnectionInitSql()
+    local index = 0
+    local function runNext(): void
+      index = index + 1
+      if index > #statements then
+        self._initialized = true
+        local waiting = self._waiting
+        self._waiting = {}
+        for _, pending in ipairs(waiting) do
+          pending()
+        end
+
+        return
+      end
+
+      self:log(statements[index], {})
+      self._driver:execute(statements[index], {}, function(_: number?, err: string?): void
+        if err ~= nil then
+          print("[nanos-orm] connection setup failed: " .. err)
+        end
+
+        runNext()
+      end)
+    end
+
+    runNext()
+  end
+
+  local function log(sql: string, values: any[]): void
+    if not self._logging then
+      return
+    end
+
+    local rendered: string[] = {}
+    for index = 1, #values do
+      table.insert(rendered, tostring(values[index]))
+    end
+
+    print("[nanos-orm] " .. sql .. " -- [" .. table.concat(rendered, ", ") .. "]")
+  end
+end

@@ -1,0 +1,32 @@
+generate_declarations = false
+annotations = ["annotations"]
+runtime_global = "NanosORM"
+runtime_export = "Package.Export(%name, %value)"
+name = "nanos-orm"
+target = "5.4"
+version = "0.1.0"
+source = "src"
+output = "out"
+
+[assets]
+"Package.toml" = "Package.toml"
+
+[dependencies]
+nanos-world-types = "github:nebra-lang/nanos-world-types"
+
+[sides]
+"src/Shared/**" = ["shared"]
+"src/Client/**" = ["client", "shared"]
+"src/Server/**" = ["server", "shared"]
+
+[code]
+index_base = 1
+import_extension = ".lua"
+import_statement = "Package.Require(%s)"
+import_path = "root"
+
+[rules]
+strict_nil = true
+
+[reflection]
+mode = "none"

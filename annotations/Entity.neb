@@ -1,0 +1,83 @@
+import { mapClass, readArgs } from "./Mapping"
+
+--- @Entity maps a class to a table and generates the NanosORM.entity(...) builder calls for all fields annotated with @Column, @Id,
+--- @ManyToOne, @OneToMany, @OneToOne or @ManyToMany. Relation targets are taken from the field type: the class of a to-one field,
+--- or T of a Collection<T> field. @Index and @UniqueConstraint on the class or on fields become indexes of the table,
+--- @Version marks the version column for optimistic locking, @Embedded stores an @Embeddable object in prefixed columns.
+--- The table name is optional and derived from the class name otherwise, so "UserModel" becomes "user".
+--- On an abstract class it creates a mapped superclass instead, which passes its columns on to the entities extending it.
+--- With @Inheritance the class becomes the root of a single table inheritance hierarchy: entities extending it are stored in its table
+--- and told apart by the discriminator column. @DiscriminatorValue sets the value of a class, an abstract root has none.
+---
+---     @Entity
+---     class UserModel extends Model
+---         @Id
+---         userID: Uuid
+---
+---         @Column
+---         username: string
+---     end
+---
+--- generates, after the class:
+---
+---     NanosORM.entity(UserModel):column("userID", "Uuid", false):id("auto"):column("username", "string", false):build()
+
+export local annotation = {
+    targets = { "Class" },
+    params = {
+        table = { type = "string", required = false }
+    }
+}
+
+export function apply(target, args)
+    local className = target.name.name
+    local entryArgs = { ir.nameExpr(className) }
+    local entryMethod = "entity"
+    local inheritance: any = nil
+    local discriminatorValue: any = nil
+    for _, annotationNode in ipairs(target.annotations or {}) do
+        local kind = annotationNode.name and annotationNode.name.name
+        if kind == "Inheritance" then
+            inheritance = readArgs(annotationNode, { "column", "length" })
+        elseif kind == "DiscriminatorValue" then
+            discriminatorValue = readArgs(annotationNode, { "value" }).value
+        end
+    end
+
+    if target.isAbstract and inheritance ~= nil then
+        if args.table ~= nil then
+            entryArgs[#entryArgs + 1] = ir.stringLiteral(args.table)
+        end
+    elseif target.isAbstract then
+        entryMethod = "mappedSuperclass"
+        if args.table ~= nil then
+            error("@Entity on the abstract class '" .. className .. "' creates a mapped superclass, which has no table")
+        end
+    elseif args.table ~= nil then
+        entryArgs[#entryArgs + 1] = ir.stringLiteral(args.table)
+    end
+
+    if target.accessors ~= nil and #target.accessors > 0 then
+        error("Entity '" .. className .. "' must not declare getters or setters, they conflict with the change tracking of the ORM")
+    end
+
+    local chain = ir.call(ir.dotAccess(ir.nameExpr("NanosORM"), entryMethod), entryArgs)
+    if inheritance ~= nil then
+        chain = ir.methodCall(chain, "inheritance", {
+            ir.stringLiteral("single"),
+            ir.stringLiteral(inheritance.column or "type"),
+            ir.numberLiteral(inheritance.length or 32)
+        })
+        if target.isAbstract then
+            chain = ir.methodCall(chain, "abstract", {})
+        end
+    end
+
+    if discriminatorValue ~= nil then
+        chain = ir.methodCall(chain, "discriminatorValue", { ir.stringLiteral(discriminatorValue) })
+    end
+
+    chain = mapClass(chain, target, true)
+    chain = ir.methodCall(chain, "build", {})
+    return { target, ir.exprStmt(chain) }
+end

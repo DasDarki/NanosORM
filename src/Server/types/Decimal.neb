@@ -1,0 +1,387 @@
+--- Defines how a Decimal is rounded when digits have to be dropped.
+export enum RoundingMode
+  --- Rounds towards zero.
+  Down = 0
+  --- Rounds away from zero.
+  Up = 1
+  --- Rounds towards negative infinity.
+  Floor = 2
+  --- Rounds towards positive infinity.
+  Ceiling = 3
+  --- Rounds to the nearest neighbour, ties away from zero.
+  HalfUp = 4
+  --- Rounds to the nearest neighbour, ties towards zero.
+  HalfDown = 5
+  --- Rounds to the nearest neighbour, ties to the even neighbour. Also known as bankers rounding.
+  HalfEven = 6
+end
+
+local DEFAULT_DIVISION_SCALE = 10
+
+local function checkedMultiply(left: number, right: number): number
+  local result = left * right
+  if left ~= 0 and (result // left ~= right or math.type(result) ~= "integer") then
+    error("Decimal overflow", 3)
+  end
+
+  return result
+end
+
+local function powerOfTen(exponent: number): number
+  local result = 1
+  for _ = 1, exponent do
+    result = checkedMultiply(result, 10)
+  end
+
+  return result
+end
+
+local function divideRounded(numerator: number, denominator: number, mode: RoundingMode): number
+  if denominator == 0 then
+    error("Division by zero", 3)
+  end
+
+  local negative = (numerator < 0) ~= (denominator < 0)
+  local absoluteNumerator = math.abs(numerator)
+  local absoluteDenominator = math.abs(denominator)
+  local quotient = absoluteNumerator // absoluteDenominator
+  local remainder = absoluteNumerator % absoluteDenominator
+  local increment = false
+  if remainder ~= 0 then
+    local doubled = remainder * 2
+    if mode == RoundingMode.Up then
+      increment = true
+    elseif mode == RoundingMode.Floor then
+      increment = negative
+    elseif mode == RoundingMode.Ceiling then
+      increment = not negative
+    elseif mode == RoundingMode.HalfUp then
+      increment = doubled >= absoluteDenominator
+    elseif mode == RoundingMode.HalfDown then
+      increment = doubled > absoluteDenominator
+    elseif mode == RoundingMode.HalfEven then
+      increment = doubled > absoluteDenominator or (doubled == absoluteDenominator and quotient % 2 == 1)
+    end
+  end
+
+  if increment then
+    quotient = quotient + 1
+  end
+
+  return negative and -quotient or quotient
+end
+
+--- An immutable decimal number with a fixed amount of digits after the decimal point.
+--- It stores an integer and a scale, so calculations are exact as long as they fit into 64 bit integers.
+export class Decimal
+
+  --- The decimal zero.
+  static ZERO: Decimal = new Decimal(0, 0)
+
+  --- The decimal one.
+  static ONE: Decimal = new Decimal(1, 0)
+
+  local _unscaled: number = 0
+  local _scale: number = 0
+
+  --- Creates a decimal from an unscaled integer and a scale, so new Decimal(1234, 2) is 12.34.
+  constructor(unscaled: number, scale: number = 0)
+    local integer = math.tointeger(unscaled)
+    if integer == nil then
+      error("The unscaled value of a Decimal has to be an integer", 2)
+    end
+
+    if scale < 0 or math.tointeger(scale) == nil then
+      error("The scale of a Decimal has to be a non negative integer", 2)
+    end
+
+    self._unscaled = integer
+    self._scale = scale
+  end
+
+  --- Parses a decimal from a string like "12.34", "-0.5" or "1.5e3". Returns nil if the string is not a valid decimal or too large.
+  static function parse(text: string): Decimal?
+    local sign, integerPart, fractionPart, exponentPart = string.match(text, "^%s*([+-]?)(%d*)%.?(%d*)[eE]?([+-]?%d*)%s*$")
+    if sign == nil or integerPart == nil or fractionPart == nil or exponentPart == nil then
+      return nil
+    end
+
+    if integerPart == "" and fractionPart == "" then
+      return nil
+    end
+
+    if exponentPart == "+" or exponentPart == "-" then
+      return nil
+    end
+
+    local digits = string.gsub(integerPart .. fractionPart, "^0+(%d)", "%1")
+    local parsedUnscaled = math.tointeger(tonumber(digits) ?? 0)
+    if parsedUnscaled == nil or #digits > 18 then
+      return nil
+    end
+
+    local unscaled: number = parsedUnscaled
+    local scale = #fractionPart - (tonumber(exponentPart) ?? 0)
+    if scale < 0 then
+      unscaled = checkedMultiply(unscaled, powerOfTen(-scale))
+      scale = 0
+    end
+
+    if sign == "-" then
+      unscaled = -unscaled
+    end
+
+    return new Decimal(unscaled, scale)
+  end
+
+  --- Creates a decimal from a number. Floating point numbers are rounded to the given maximum scale and trailing zeros are removed.
+  static function fromNumber(value: number, maxScale: number = 10): Decimal
+    local integer = math.tointeger(value)
+    if integer ~= nil then
+      return new Decimal(integer, 0)
+    end
+
+    local parsed = Decimal.parse(string.format("%." .. maxScale .. "f", value))
+    if parsed == nil then
+      error("Cannot convert " .. tostring(value) .. " into a Decimal", 2)
+    end
+
+    return parsed:stripTrailingZeros()
+  end
+
+  --- Converts a decimal, number or string into a decimal. Raises an error for invalid strings.
+  static function of(value: Decimal | number | string): Decimal
+    if value instanceof Decimal then
+      return value
+    elseif value is number then
+      return Decimal.fromNumber(value)
+    end
+
+    local parsed = Decimal.parse(value as string)
+    if parsed == nil then
+      error("Invalid decimal: " .. tostring(value), 2)
+    end
+
+    return parsed
+  end
+
+  --- Returns the smaller of both decimals.
+  static function min(first: Decimal, second: Decimal): Decimal
+    return first:compareTo(second) <= 0 and first or second
+  end
+
+  --- Returns the larger of both decimals.
+  static function max(first: Decimal, second: Decimal): Decimal
+    return first:compareTo(second) >= 0 and first or second
+  end
+
+  --- Returns the unscaled integer value.
+  function getUnscaled(): number
+    return self._unscaled
+  end
+
+  --- Returns the amount of digits after the decimal point.
+  function getScale(): number
+    return self._scale
+  end
+
+  --- Returns a decimal with the given scale, rounding with the given mode if digits are dropped.
+  function setScale(scale: number, mode: RoundingMode = RoundingMode.HalfUp): Decimal
+    if scale == self._scale then
+      return self
+    elseif scale > self._scale then
+      return new Decimal(checkedMultiply(self._unscaled, powerOfTen(scale - self._scale)), scale)
+    end
+
+    return new Decimal(divideRounded(self._unscaled, powerOfTen(self._scale - scale), mode), scale)
+  end
+
+  --- Rounds to the given amount of digits after the decimal point.
+  function round(scale: number = 0, mode: RoundingMode = RoundingMode.HalfUp): Decimal
+    return self:setScale(scale, mode)
+  end
+
+  --- Removes trailing zeros after the decimal point, but never goes below the given minimum scale.
+  function stripTrailingZeros(minimumScale: number = 0): Decimal
+    local unscaled = self._unscaled
+    local scale = self._scale
+    while scale > minimumScale and unscaled % 10 == 0 do
+      unscaled = unscaled // 10
+      scale = scale - 1
+    end
+
+    return new Decimal(unscaled, scale)
+  end
+
+  --- Returns the sum of both values.
+  function plus(other: Decimal | number | string): Decimal
+    local right = Decimal.of(other)
+    local scale = math.max(self._scale, right:getScale())
+    return new Decimal(self:setScale(scale):getUnscaled() + right:setScale(scale):getUnscaled(), scale)
+  end
+
+  --- Returns the difference of both values.
+  function minus(other: Decimal | number | string): Decimal
+    return self:plus(Decimal.of(other):negate())
+  end
+
+  --- Returns the product of both values. The scale of the result is the sum of both scales.
+  function multiply(other: Decimal | number | string): Decimal
+    local right = Decimal.of(other)
+    return new Decimal(checkedMultiply(self._unscaled, right:getUnscaled()), self._scale + right:getScale())
+  end
+
+  --- Returns the quotient of both values with the given scale. Without a scale, at least 10 digits are calculated and trailing zeros are removed.
+  function divide(other: Decimal | number | string, scale: number? = nil, mode: RoundingMode = RoundingMode.HalfUp): Decimal
+    local right = Decimal.of(other)
+    if right:isZero() then
+      error("Division by zero", 2)
+    end
+
+    local resultScale = scale ?? math.max(self._scale, right:getScale(), DEFAULT_DIVISION_SCALE)
+    local shift = resultScale + right:getScale() - self._scale
+    local numerator = self._unscaled
+    local denominator = right:getUnscaled()
+    if shift >= 0 then
+      numerator = checkedMultiply(numerator, powerOfTen(shift))
+    else
+      denominator = checkedMultiply(denominator, powerOfTen(-shift))
+    end
+
+    local result = new Decimal(divideRounded(numerator, denominator, mode), resultScale)
+    if scale == nil then
+      return result:stripTrailingZeros(math.max(self._scale, right:getScale()))
+    end
+
+    return result
+  end
+
+  --- Returns the remainder of the division by the other value, with the sign of this value.
+  function remainder(other: Decimal | number | string): Decimal
+    local right = Decimal.of(other)
+    local quotient = self:divide(right, 0, RoundingMode.Down)
+    return self:minus(quotient:multiply(right))
+  end
+
+  --- Returns the negated value.
+  function negate(): Decimal
+    return new Decimal(-self._unscaled, self._scale)
+  end
+
+  --- Returns the absolute value.
+  function abs(): Decimal
+    return self._unscaled < 0 and self:negate() or self
+  end
+
+  --- Returns -1, 0 or 1 depending on the sign of this value.
+  function signum(): number
+    if self._unscaled < 0 then
+      return -1
+    elseif self._unscaled > 0 then
+      return 1
+    end
+
+    return 0
+  end
+
+  --- Returns whether this value is zero.
+  function isZero(): boolean
+    return self._unscaled == 0
+  end
+
+  --- Returns whether this value is below zero.
+  function isNegative(): boolean
+    return self._unscaled < 0
+  end
+
+  --- Returns whether this value is above zero.
+  function isPositive(): boolean
+    return self._unscaled > 0
+  end
+
+  --- Returns -1, 0 or 1 depending on whether this value is smaller, equal or larger than the other.
+  function compareTo(other: Decimal | number | string): number
+    local right = Decimal.of(other)
+    local scale = math.max(self._scale, right:getScale())
+    local left = self:setScale(scale):getUnscaled()
+    local compared = right:setScale(scale):getUnscaled()
+    if left < compared then
+      return -1
+    elseif left > compared then
+      return 1
+    end
+
+    return 0
+  end
+
+  --- Returns whether both values are numerically equal, ignoring the scale. So 1.50 equals 1.5.
+  function equals(other: Decimal | number | string): boolean
+    return self:compareTo(other) == 0
+  end
+
+  --- Returns the integer part, rounded with the given mode.
+  function toInteger(mode: RoundingMode = RoundingMode.Down): number
+    return self:setScale(0, mode):getUnscaled()
+  end
+
+  --- Returns the value as a floating point number, which may lose precision.
+  function toNumber(): number
+    return self._unscaled / powerOfTen(self._scale)
+  end
+
+  --- Returns the value as a plain string like "-12.34" with exactly scale digits after the decimal point.
+  function toString(): string
+    local digits = tostring(math.abs(self._unscaled))
+    local sign = self._unscaled < 0 and "-" or ""
+    if self._scale == 0 then
+      return sign .. digits
+    end
+
+    if #digits <= self._scale then
+      digits = string.rep("0", self._scale - #digits + 1) .. digits
+    end
+
+    local split = #digits - self._scale
+    return sign .. string.sub(digits, 1, split) .. "." .. string.sub(digits, split + 1)
+  end
+
+  function __tostring(): string
+    return self:toString()
+  end
+
+  operator +(other: Decimal): Decimal
+    return self:plus(other)
+  end
+
+  operator -(other: Decimal): Decimal
+    return self:minus(other)
+  end
+
+  operator -(): Decimal
+    return self:negate()
+  end
+
+  operator *(other: Decimal): Decimal
+    return self:multiply(other)
+  end
+
+  operator /(other: Decimal): Decimal
+    return self:divide(other)
+  end
+
+  operator %(other: Decimal): Decimal
+    return self:remainder(other)
+  end
+
+  operator ==(other: Decimal): boolean
+    return self:compareTo(other) == 0
+  end
+
+  operator <(other: Decimal): boolean
+    return self:compareTo(other) < 0
+  end
+
+  operator <=(other: Decimal): boolean
+    return self:compareTo(other) <= 0
+  end
+end

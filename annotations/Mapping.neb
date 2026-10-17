@@ -1,0 +1,392 @@
+local BUILTIN_TYPES: { [string]: boolean } = {
+    DateTime = true, Duration = true, Decimal = true, Money = true, Uuid = true,
+    SteamId = true, Json = true, Vector = true, Rotator = true, Color = true
+}
+
+local PRIMITIVE_TYPES: { [string]: string } = {
+    PrimitiveString = "string",
+    PrimitiveNumber = "number",
+    PrimitiveBoolean = "boolean"
+}
+
+local COLUMN_PARAMS = { "name", "type", "length", "precision", "scale", "unique", "nullable", "currency" }
+local ID_PARAMS = { "strategy" }
+
+local RELATION_PARAMS: { [string]: string[] } = {
+    ManyToOne = { "target", "joinColumn", "nullable", "onDelete", "cascade", "fetch", "inversedBy" },
+    OneToMany = { "mappedBy", "target", "orderBy", "cascade", "fetch", "orphanRemoval" },
+    OneToOne = { "target", "mappedBy", "inversedBy", "joinColumn", "nullable", "onDelete", "cascade", "fetch", "orphanRemoval" },
+    ManyToMany = { "target", "mappedBy", "inversedBy", "joinTable", "joinColumn", "inverseJoinColumn", "orderBy", "cascade", "fetch" }
+}
+
+local INDEX_PARAMS = { "fields", "name" }
+
+local INDEX_METHODS: { [string]: string } = {
+    Index = "index",
+    UniqueConstraint = "uniqueConstraint"
+}
+
+local RELATION_METHODS: { [string]: string } = {
+    ManyToOne = "manyToOne",
+    OneToMany = "oneToMany",
+    OneToOne = "oneToOne",
+    ManyToMany = "manyToMany"
+}
+
+local function argName(arg)
+    if type(arg.name) == "table" then
+        return arg.name.name
+    end
+
+    return arg.name
+end
+
+local function literalValue(value)
+    if value == nil then
+        return nil
+    elseif value.__kind == "StringLiteralExpr" then
+        return value.value
+    elseif value.__kind == "NumberLiteralExpr" then
+        return tonumber(value.raw)
+    elseif value.__kind == "BoolLiteralExpr" then
+        return value.value
+    end
+
+    return nil
+end
+
+export function readArgs(annotationNode, order)
+    local values = {}
+    for index, arg in ipairs(annotationNode.args or {}) do
+        local key = argName(arg) or order[index]
+        if key ~= nil then
+            values[key] = literalValue(arg.value)
+        end
+    end
+
+    return values
+end
+
+local EMBEDDED_PARAMS = { "prefix", "nullable" }
+
+local function findAnnotations(field)
+    local column: any, id: any, relationKind: any, relation: any, version: any, embedded: any
+    for _, annotationNode in ipairs(field.annotations or {}) do
+        local name = annotationNode.name and annotationNode.name.name
+        if name == "Embedded" then
+            embedded = readArgs(annotationNode, EMBEDDED_PARAMS)
+        elseif name == "Column" then
+            column = readArgs(annotationNode, COLUMN_PARAMS)
+        elseif name == "Id" then
+            id = readArgs(annotationNode, ID_PARAMS)
+        elseif name == "Version" then
+            version = true
+        elseif RELATION_PARAMS[name] ~= nil then
+            if relationKind ~= nil then
+                error("Field '" .. field.name.name .. "' has more than one relation annotation")
+            end
+
+            relationKind = name
+            relation = readArgs(annotationNode, RELATION_PARAMS[name])
+        end
+    end
+
+    return column, id, relationKind, relation, version, embedded
+end
+
+local function indexCall(chain, kind, fields, name)
+    local fieldLiterals = {}
+    for _, fieldName in ipairs(fields) do
+        fieldLiterals[#fieldLiterals + 1] = ir.stringLiteral(fieldName)
+    end
+
+    local callArgs = { ir.table(fieldLiterals) }
+    if name ~= nil then
+        callArgs[2] = ir.stringLiteral(name)
+    end
+
+    return ir.methodCall(chain, INDEX_METHODS[kind], callArgs)
+end
+
+local function fieldNames(text)
+    local names = {}
+    for entry in string.gmatch(text, "[^,]+") do
+        local trimmed = string.gsub(entry, "^%s*(.-)%s*$", "%1")
+        if trimmed ~= "" then
+            names[#names + 1] = trimmed
+        end
+    end
+
+    return names
+end
+
+local function splitList(text)
+    local entries = {}
+    for entry in string.gmatch(text, "[^,]+") do
+        local trimmed = string.gsub(entry, "^%s*(.-)%s*$", "%1")
+        if trimmed ~= "" then
+            entries[#entries + 1] = ir.stringLiteral(trimmed)
+        end
+    end
+
+    return entries
+end
+
+local function relationTarget(className, fieldName, kind, typeRef)
+    local isToMany = kind == "OneToMany" or kind == "ManyToMany"
+    if typeRef ~= nil and typeRef.__kind == "NullableTypeRef" then
+        typeRef = typeRef.innerType
+    end
+
+    local typeKind = typeRef and typeRef.__kind
+    if isToMany then
+        if typeKind == "GenericTypeRef" and typeRef.name.name == "Collection" and typeRef.arguments ~= nil and typeRef.arguments[1] ~= nil then
+            local argument = typeRef.arguments[1].type
+            if argument ~= nil and argument.__kind == "NamedTypeRef" then
+                return argument.name.name
+            end
+        end
+
+        error("The " .. kind .. " field '" .. className .. "." .. fieldName .. "' has to be a Collection<Entity>")
+    end
+
+    if typeKind == "NamedTypeRef" then
+        return typeRef.name.name
+    end
+
+    error("The " .. kind .. " field '" .. className .. "." .. fieldName .. "' has to be typed with the target entity class")
+end
+
+local function relationCalls(chain, className, field, kind, relation)
+    local fieldName = field.name.name
+    if field.isStatic then
+        error("Static field '" .. className .. "." .. fieldName .. "' cannot be a relation")
+    end
+
+    local targetName = relation.target or relationTarget(className, fieldName, kind, field.typeAnnotation)
+    local callArgs = { ir.stringLiteral(fieldName), ir.stringLiteral(targetName) }
+    if relation.mappedBy ~= nil then
+        callArgs[3] = ir.stringLiteral(relation.mappedBy)
+    end
+
+    chain = ir.methodCall(chain, RELATION_METHODS[kind], callArgs)
+    local isOwningToOne = kind == "ManyToOne" or (kind == "OneToOne" and relation.mappedBy == nil)
+    if isOwningToOne then
+        local nullable = field.typeAnnotation ~= nil and field.typeAnnotation.__kind == "NullableTypeRef"
+        if relation.nullable ~= nil then
+            nullable = relation.nullable
+        end
+
+        chain = ir.methodCall(chain, "nullable", { ir.boolLiteral(nullable) })
+    end
+
+    if relation.joinColumn ~= nil and relation.joinTable == nil then
+        chain = ir.methodCall(chain, "joinColumn", { ir.stringLiteral(relation.joinColumn) })
+    end
+
+    if relation.onDelete ~= nil then
+        chain = ir.methodCall(chain, "onDelete", { ir.stringLiteral(relation.onDelete) })
+    end
+
+    if relation.inversedBy ~= nil then
+        chain = ir.methodCall(chain, "inversedBy", { ir.stringLiteral(relation.inversedBy) })
+    end
+
+    if relation.joinTable ~= nil then
+        local tableArgs = { ir.stringLiteral(relation.joinTable) }
+        tableArgs[2] = relation.joinColumn ~= nil and ir.stringLiteral(relation.joinColumn) or ir.nilLiteral()
+        tableArgs[3] = relation.inverseJoinColumn ~= nil and ir.stringLiteral(relation.inverseJoinColumn) or ir.nilLiteral()
+        chain = ir.methodCall(chain, "joinTable", tableArgs)
+    elseif relation.inverseJoinColumn ~= nil then
+        error("inverseJoinColumn of '" .. className .. "." .. fieldName .. "' needs joinTable")
+    end
+
+    if relation.cascade ~= nil then
+        chain = ir.methodCall(chain, "cascade", { ir.stringLiteral(relation.cascade) })
+    end
+
+    if relation.orderBy ~= nil then
+        chain = ir.methodCall(chain, "orderBy", splitList(relation.orderBy))
+    end
+
+    if relation.orphanRemoval then
+        chain = ir.methodCall(chain, "orphanRemoval", {})
+    end
+
+    if relation.fetch ~= nil then
+        chain = ir.methodCall(chain, "fetch", { ir.stringLiteral(relation.fetch) })
+    end
+
+    return chain
+end
+
+local function typeExpression(className, fieldName, typeRef)
+    local kind = typeRef and typeRef.__kind
+    if kind == "PrimitiveTypeRef" then
+        local primitive = PRIMITIVE_TYPES[typeRef.kind]
+        if primitive == nil then
+            error("Field '" .. className .. "." .. fieldName .. "' has a type that cannot be mapped to a column, use @Column(type = ...)")
+        end
+
+        return ir.stringLiteral(primitive)
+    elseif kind == "NamedTypeRef" or kind == "GenericTypeRef" then
+        local name = typeRef.name.name
+        if BUILTIN_TYPES[name] then
+            return ir.stringLiteral(name)
+        end
+
+        return ir.nameExpr(name)
+    end
+
+    error("Field '" .. className .. "." .. fieldName .. "' has a type that cannot be mapped to a column, use a single class, enum or primitive type or @Column(type = ...)")
+end
+
+local function embeddedCalls(chain, className, field, embedded)
+    local fieldName = field.name.name
+    if field.isStatic then
+        error("Static field '" .. className .. "." .. fieldName .. "' cannot be embedded")
+    end
+
+    local typeRef = field.typeAnnotation
+    local nullable = false
+    if typeRef ~= nil and typeRef.__kind == "NullableTypeRef" then
+        nullable = true
+        typeRef = typeRef.innerType
+    end
+
+    if typeRef == nil or typeRef.__kind ~= "NamedTypeRef" then
+        error("The embedded field '" .. className .. "." .. fieldName .. "' has to be typed with an @Embeddable class")
+    end
+
+    if embedded.nullable ~= nil then
+        nullable = embedded.nullable
+    end
+
+    local callArgs = { ir.stringLiteral(fieldName), ir.nameExpr(typeRef.name.name) }
+    if embedded.prefix ~= nil then
+        callArgs[3] = ir.stringLiteral(embedded.prefix)
+    end
+
+    chain = ir.methodCall(chain, "embedded", callArgs)
+    return ir.methodCall(chain, "nullable", { ir.boolLiteral(nullable) })
+end
+
+--- Adds the builder calls for the annotated fields and the indexes of a class to the chain. Embeddables only allow @Column fields.
+export function mapClass(chain, target, isEntity)
+    local className = target.name.name
+    for _, field in ipairs(target.fields or {}) do
+        local column: any, id, relationKind, relation, version, embedded = findAnnotations(field)
+        if not isEntity and (relationKind ~= nil or id ~= nil or version ~= nil or embedded ~= nil) then
+            error("Field '" .. className .. "." .. field.name.name .. "' of an embeddable can only be a @Column")
+        end
+
+        if embedded ~= nil and (column ~= nil or id ~= nil or relationKind ~= nil) then
+            error("Field '" .. className .. "." .. field.name.name .. "' cannot be embedded and a column or relation at once")
+        end
+
+        if embedded ~= nil then
+            chain = embeddedCalls(chain, className, field, embedded)
+        end
+
+        if version ~= nil then
+            column = column or {}
+            if column.type == nil then
+                column.type = "integer"
+            end
+        end
+
+        if relationKind ~= nil then
+            if column ~= nil or id ~= nil then
+                error("Field '" .. className .. "." .. field.name.name .. "' cannot be a relation and a column at once")
+            end
+
+            chain = relationCalls(chain, className, field, relationKind, relation)
+        elseif column ~= nil or id ~= nil then
+            column = column or {}
+            local fieldName = field.name.name
+            if field.isStatic then
+                error("Static field '" .. className .. "." .. fieldName .. "' cannot be a column")
+            end
+
+            local typeRef = field.typeAnnotation
+            local nullable = false
+            if typeRef ~= nil and typeRef.__kind == "NullableTypeRef" then
+                nullable = true
+                typeRef = typeRef.innerType
+            end
+
+            if column.nullable ~= nil then
+                nullable = column.nullable
+            end
+
+            local typeArg: any
+            if column.type ~= nil then
+                typeArg = ir.stringLiteral(column.type)
+            else
+                typeArg = typeExpression(className, fieldName, typeRef)
+            end
+
+            chain = ir.methodCall(chain, "column", { ir.stringLiteral(fieldName), typeArg, ir.boolLiteral(nullable) })
+            if id ~= nil then
+                chain = ir.methodCall(chain, "id", { ir.stringLiteral(id.strategy or "auto") })
+            end
+
+            if version ~= nil then
+                chain = ir.methodCall(chain, "version", {})
+            end
+
+            if column.name ~= nil then
+                chain = ir.methodCall(chain, "name", { ir.stringLiteral(column.name) })
+            end
+
+            if column.length ~= nil then
+                chain = ir.methodCall(chain, "length", { ir.numberLiteral(column.length) })
+            end
+
+            if column.precision ~= nil then
+                local precisionArgs = { ir.numberLiteral(column.precision) }
+                if column.scale ~= nil then
+                    precisionArgs[2] = ir.numberLiteral(column.scale)
+                end
+
+                chain = ir.methodCall(chain, "precision", precisionArgs)
+            end
+
+            if column.unique then
+                chain = ir.methodCall(chain, "unique", {})
+            end
+
+            if column.currency ~= nil then
+                chain = ir.methodCall(chain, "currency", { ir.stringLiteral(column.currency) })
+            end
+        end
+    end
+
+    for _, annotationNode in ipairs(target.annotations or {}) do
+        local kind = annotationNode.name and annotationNode.name.name
+        if INDEX_METHODS[kind] ~= nil and not isEntity then
+            error("The embeddable '" .. className .. "' cannot have indexes, declare them on the embedding entity")
+        elseif INDEX_METHODS[kind] ~= nil then
+            local values = readArgs(annotationNode, INDEX_PARAMS)
+            if values.fields == nil then
+                error("@" .. kind .. " on the class '" .. className .. "' needs fields")
+            end
+
+            chain = indexCall(chain, kind, fieldNames(values.fields), values.name)
+        end
+    end
+
+    for _, field in ipairs(target.fields or {}) do
+        for _, annotationNode in ipairs(field.annotations or {}) do
+            local kind = annotationNode.name and annotationNode.name.name
+            if INDEX_METHODS[kind] ~= nil and not isEntity then
+                error("The embeddable '" .. className .. "' cannot have indexes, declare them on the embedding entity")
+            elseif INDEX_METHODS[kind] ~= nil then
+                local values = readArgs(annotationNode, INDEX_PARAMS)
+                chain = indexCall(chain, kind, { field.name.name }, values.name)
+            end
+        end
+    end
+
+    return chain
+end

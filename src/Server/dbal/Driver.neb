@@ -1,0 +1,65 @@
+--- Runs SQL against a database. Implementations decide how queries are sent and how parameters are referenced,
+--- while the SQL itself is generated with a Platform. Callbacks receive (result, error).
+export interface Driver
+
+  --- Returns the SQL that references the parameter with the given zero based index, for example ":0" or "?".
+  method getPlaceholder(index: number): string
+
+  --- Runs a query that returns rows. The callback receives the rows or an error.
+  method select(sql: string, params: any[], callback: (any[]?, string?) -> void): void
+
+  --- Runs a statement. The callback receives the number of affected rows or an error.
+  method execute(sql: string, params: any[], callback: (number?, string?) -> void): void
+
+  --- Returns whether consecutive statements are guaranteed to run on the same connection, which transactions require.
+  method supportsTransactions(): boolean
+
+  --- Closes the driver and its connections.
+  method close(): void
+
+end
+
+--- Runs queries with the Database class of nanos world. Parameters are referenced as ":0", ":1" and so on.
+--- Transactions are only supported with a pool size of 1, since nanos may run the statements of a larger pool on different connections.
+export class NanosDriver implements Driver
+
+  local _database: Database
+  local _poolSize: number = 1
+
+  constructor(engine: DatabaseEngine, connectionString: string, poolSize: number = 1)
+    self._poolSize = poolSize
+    self._database = new Database(engine, connectionString, poolSize)
+  end
+
+  function getPlaceholder(index: number): string
+    return ":" .. index
+  end
+
+  function select(sql: string, params: any[], callback: (any[]?, string?) -> void): void
+    self._database:SelectAsync(sql, function(rows: any, err: any): void
+      if err ~= nil and err ~= "" then
+        callback(nil, tostring(err))
+      else
+        callback(rows ?? {}, nil)
+      end
+    end, table.unpack(params, 1, #params))
+  end
+
+  function execute(sql: string, params: any[], callback: (number?, string?) -> void): void
+    self._database:ExecuteAsync(sql, function(affected: any, err: any): void
+      if err ~= nil and err ~= "" then
+        callback(nil, tostring(err))
+      else
+        callback(tonumber(affected) ?? 0, nil)
+      end
+    end, table.unpack(params, 1, #params))
+  end
+
+  function supportsTransactions(): boolean
+    return self._poolSize == 1
+  end
+
+  function close(): void
+    self._database:Close()
+  end
+end

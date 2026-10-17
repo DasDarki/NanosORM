@@ -1,0 +1,122 @@
+local STEAM64_BASE = 76561197960265728
+local MAX_ACCOUNT_ID = 0xFFFFFFFF
+
+--- An immutable Steam account identifier of an individual account.
+--- SteamID64 values do not fit into a double without losing precision, so they are handled as strings outside of this class.
+export class SteamId
+
+  local _accountId: number = 0
+
+  --- Creates a SteamId from the 32 bit account id.
+  constructor(accountId: number)
+    local integer = math.tointeger(accountId)
+    if integer == nil or integer < 1 or integer > MAX_ACCOUNT_ID then
+      error("Invalid Steam account id: " .. tostring(accountId), 2)
+    end
+
+    self._accountId = integer
+  end
+
+  --- Parses a SteamID64 like "76561198000000000", a SteamID2 like "STEAM_1:0:19867136", a SteamID3 like "[U:1:39734272]"
+  --- or a profile url like "https://steamcommunity.com/profiles/76561198000000000". Returns nil if the text is not valid.
+  static function parse(text: string): SteamId?
+    local trimmed = string.gsub(text, "^%s*(.-)%s*$", "%1")
+    local profileId = string.match(trimmed, "steamcommunity%.com/profiles/(%d+)/?$")
+    if profileId ~= nil then
+      return SteamId.fromSteam64(profileId)
+    end
+
+    if string.match(trimmed, "^%d+$") ~= nil then
+      return SteamId.fromSteam64(trimmed)
+    end
+
+    local lowBit, highBits = string.match(trimmed, "^STEAM_%d:([01]):(%d+)$")
+    if lowBit ~= nil and highBits ~= nil then
+      local accountId = math.tointeger((tonumber(highBits) ?? 0) * 2 + (tonumber(lowBit) ?? 0))
+      if accountId == nil or accountId < 1 or accountId > MAX_ACCOUNT_ID then
+        return nil
+      end
+
+      return new SteamId(accountId)
+    end
+
+    local steam3 = string.match(trimmed, "^%[?U:1:(%d+)%]?$")
+    if steam3 ~= nil then
+      local accountId = math.tointeger(tonumber(steam3) ?? 0)
+      if accountId == nil or accountId < 1 or accountId > MAX_ACCOUNT_ID then
+        return nil
+      end
+
+      return new SteamId(accountId)
+    end
+
+    return nil
+  end
+
+  --- Creates a SteamId from a SteamID64 given as string. Returns nil if it is not a valid individual account.
+  static function fromSteam64(steam64: string): SteamId?
+    if string.match(steam64, "^%d+$") == nil or #steam64 > 19 then
+      return nil
+    end
+
+    local value = math.tointeger(tonumber(steam64) ?? 0)
+    if value == nil then
+      return nil
+    end
+
+    local accountId = value - STEAM64_BASE
+    if accountId < 1 or accountId > MAX_ACCOUNT_ID then
+      return nil
+    end
+
+    return new SteamId(accountId)
+  end
+
+  --- Returns the SteamId of the given player.
+  static function fromPlayer(player: Player): SteamId?
+    return SteamId.fromSteam64(player:GetSteamID())
+  end
+
+  --- Returns the 32 bit account id.
+  function getAccountId(): number
+    return self._accountId
+  end
+
+  --- Returns the SteamID64 as string, for example "76561198000000000".
+  function toSteam64(): string
+    return string.format("%d", STEAM64_BASE + self._accountId)
+  end
+
+  --- Returns the SteamID2, for example "STEAM_1:0:19867136". Older Source games use universe 0.
+  function toSteam2(universe: number = 1): string
+    return "STEAM_" .. universe .. ":" .. self._accountId % 2 .. ":" .. self._accountId // 2
+  end
+
+  --- Returns the SteamID3, for example "[U:1:39734272]".
+  function toSteam3(): string
+    return "[U:1:" .. self._accountId .. "]"
+  end
+
+  --- Returns the url of the Steam community profile.
+  function getProfileUrl(): string
+    return "https://steamcommunity.com/profiles/" .. self:toSteam64()
+  end
+
+  --- Returns whether both ids belong to the same account.
+  function equals(other: SteamId): boolean
+    return self._accountId == other:getAccountId()
+  end
+
+  --- Returns the SteamID64.
+  function toString(): string
+    return self:toSteam64()
+  end
+
+  function __tostring(): string
+    return self:toSteam64()
+  end
+
+  operator ==(other: SteamId): boolean
+    return self:equals(other)
+  end
+end

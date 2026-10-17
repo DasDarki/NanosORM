@@ -1,0 +1,174 @@
+import { ColumnType } from "../types/ColumnType"
+import { ColumnMetadata } from "./Metadata"
+import { Platform } from "../dbal/Platform"
+import { StringColumn, TextColumn, IntegerColumn, NumberColumn, BooleanColumn } from "../types/columns/PrimitiveColumns"
+import { DateTimeColumn, DateColumn, DurationColumn } from "../types/columns/TimeColumns"
+import { DecimalColumn, MoneyColumn } from "../types/columns/MoneyColumns"
+import { UuidColumn, SteamIdColumn } from "../types/columns/IdentifierColumns"
+import { JsonColumn, EnumColumn } from "../types/columns/StructuredColumns"
+import { VectorColumn, RotatorColumn, ColorColumn } from "../types/columns/NanosColumns"
+import { Currency } from "../types/Money"
+import { DateTime } from "../types/DateTime"
+import { Duration } from "../types/Duration"
+import { Decimal } from "../types/Decimal"
+import { Money } from "../types/Money"
+import { Uuid } from "../types/Uuid"
+import { SteamId } from "../types/SteamId"
+import { Json } from "../types/Json"
+
+--- Maps type names and classes to column types. Custom types can be registered by name and optionally by their class table.
+export class TypeRegistry
+
+  local static _byName: { [string]: (ColumnMetadata) -> ColumnType<any> } = {}
+  local static _byClass: { [any]: string } = {}
+
+  --- Registers a factory for the given type name. If a class table is given, fields declared with that class resolve to this type as well.
+  static function register(name: string, factory: (ColumnMetadata) -> ColumnType<any>, typeClass: any = nil): void
+    TypeRegistry._byName[name] = factory
+    if typeClass ~= nil then
+      TypeRegistry._byClass[typeClass] = name
+    end
+  end
+
+  --- Returns whether a type with the given name is registered.
+  static function has(name: string): boolean
+    return TypeRegistry._byName[name] ~= nil
+  end
+
+  --- Converts a value object, like a DateTime or Uuid, into the value stored in the database, using the type registered for its class.
+  --- Other values are returned unchanged.
+  static function toDatabaseValue(value: any, platform: Platform): any
+    if type(value) ~= "table" then
+      return value
+    end
+
+    local valueClass = getmetatable(value)
+    if type(valueClass) ~= "table" then
+      return value
+    end
+
+    local name = TypeRegistry._byClass[valueClass]
+    if name == nil and type(rawget(valueClass, "__name")) == "string" then
+      name = rawget(valueClass, "__name") as string
+    end
+
+    if name == nil or TypeRegistry._byName[name] == nil then
+      return value
+    end
+
+    local column = new ColumnMetadata("value", "value")
+    column.typeRef = name
+    return TypeRegistry.resolve(column):toDatabase(value, platform)
+  end
+
+  --- Resolves the column type of the given column from its type reference.
+  --- The reference may be a registered type name, a registered class, a class whose name is registered, an enum table or a ColumnType instance.
+  static function resolve(column: ColumnMetadata): ColumnType<any>
+    local typeRef = column.typeRef
+    if typeRef is string then
+      local factory = TypeRegistry._byName[typeRef]
+      if factory == nil then
+        error("Unknown column type '" .. typeRef .. "' for field '" .. column.fieldName .. "'", 3)
+      end
+
+      return factory(column)
+    end
+
+    if type(typeRef) ~= "table" then
+      error("Field '" .. column.fieldName .. "' has no column type", 3)
+    end
+
+    if type(typeRef.getSqlType) == "function" and type(typeRef.fromDatabase) == "function" then
+      return typeRef as ColumnType<any>
+    end
+
+    local registeredName = TypeRegistry._byClass[typeRef]
+    if registeredName == nil and type(rawget(typeRef, "__name")) == "string" then
+      registeredName = rawget(typeRef, "__name") as string
+    end
+
+    if registeredName ~= nil then
+      local factory = TypeRegistry._byName[registeredName]
+      if factory ~= nil then
+        return factory(column)
+      end
+    end
+
+    if getmetatable(typeRef) == nil and rawget(typeRef, "new") == nil then
+      return new EnumColumn(typeRef)
+    end
+
+    error("Unknown column type for field '" .. column.fieldName .. "'", 3)
+  end
+end
+
+TypeRegistry.register("string", function(column: ColumnMetadata): ColumnType<any>
+  return new StringColumn(column.length ?? 255)
+end)
+
+TypeRegistry.register("text", function(column: ColumnMetadata): ColumnType<any>
+  return new TextColumn()
+end)
+
+TypeRegistry.register("number", function(column: ColumnMetadata): ColumnType<any>
+  return new NumberColumn()
+end)
+
+TypeRegistry.register("integer", function(column: ColumnMetadata): ColumnType<any>
+  return new IntegerColumn(false)
+end)
+
+TypeRegistry.register("bigint", function(column: ColumnMetadata): ColumnType<any>
+  return new IntegerColumn(true)
+end)
+
+TypeRegistry.register("boolean", function(column: ColumnMetadata): ColumnType<any>
+  return new BooleanColumn()
+end)
+
+TypeRegistry.register("DateTime", function(column: ColumnMetadata): ColumnType<any>
+  return new DateTimeColumn()
+end, DateTime)
+TypeRegistry.register("date", function(column: ColumnMetadata): ColumnType<any>
+  return new DateColumn()
+end)
+
+TypeRegistry.register("Duration", function(column: ColumnMetadata): ColumnType<any>
+  return new DurationColumn()
+end, Duration)
+TypeRegistry.register("Decimal", function(column: ColumnMetadata): ColumnType<any>
+  return new DecimalColumn(column.precision ?? 18, column.scale ?? 2)
+end, Decimal)
+TypeRegistry.register("Money", function(column: ColumnMetadata): ColumnType<any>
+  local code = column.currency
+  if code == nil then
+    return new MoneyColumn()
+  end
+
+  local currency = Currency.of(code)
+  if currency == nil then
+    error("Unknown currency '" .. code .. "' for field '" .. column.fieldName .. "'", 4)
+  end
+
+  return new MoneyColumn(currency)
+end, Money)
+TypeRegistry.register("Uuid", function(column: ColumnMetadata): ColumnType<any>
+  return new UuidColumn()
+end, Uuid)
+TypeRegistry.register("SteamId", function(column: ColumnMetadata): ColumnType<any>
+  return new SteamIdColumn()
+end, SteamId)
+TypeRegistry.register("Json", function(column: ColumnMetadata): ColumnType<any>
+  return new JsonColumn()
+end, Json)
+TypeRegistry.register("Vector", function(column: ColumnMetadata): ColumnType<any>
+  return new VectorColumn()
+end)
+
+TypeRegistry.register("Rotator", function(column: ColumnMetadata): ColumnType<any>
+  return new RotatorColumn()
+end)
+
+TypeRegistry.register("Color", function(column: ColumnMetadata): ColumnType<any>
+  return new ColorColumn()
+end)

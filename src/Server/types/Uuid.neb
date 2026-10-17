@@ -1,0 +1,144 @@
+local VARIANT_CHARACTERS = "89ab"
+
+local function randomHex(length: number): string
+  local parts: string[] = {}
+  for _ = 1, length do
+    table.insert(parts, string.format("%x", math.random(0, 15)))
+  end
+
+  return table.concat(parts)
+end
+
+local function randomVariant(): string
+  local index = math.random(1, 4)
+  return string.sub(VARIANT_CHARACTERS, index, index)
+end
+
+--- An immutable universally unique identifier following RFC 9562.
+--- Use Uuid.v7 for primary keys, since these are sorted by creation time and keep database indexes compact.
+export class Uuid
+
+  --- The nil UUID consisting of zeros only.
+  static NIL: Uuid = new Uuid("00000000000000000000000000000000")
+
+  local static _lastTimestamp: number = 0
+  local static _counter: number = 0
+
+  local _hex: string = ""
+
+  --- Creates a UUID from 32 hexadecimal characters without dashes. Use Uuid.parse for other notations.
+  constructor(hex: string)
+    if #hex ~= 32 or string.match(hex, "^%x+$") == nil then
+      error("Invalid UUID: " .. hex, 2)
+    end
+
+    self._hex = string.lower(hex)
+  end
+
+  --- Creates a random version 4 UUID.
+  static function v4(): Uuid
+    return new Uuid(randomHex(12) .. "4" .. randomHex(3) .. randomVariant() .. randomHex(15))
+  end
+
+  --- Creates a version 7 UUID, which starts with the current unix timestamp in milliseconds. UUIDs created by this server are strictly increasing.
+  static function v7(): Uuid
+    local timestamp = math.floor(Server.GetTime())
+    if timestamp <= Uuid._lastTimestamp then
+      timestamp = Uuid._lastTimestamp
+      Uuid._counter = Uuid._counter + 1
+      if Uuid._counter > 0xFFF then
+        timestamp = timestamp + 1
+        Uuid._counter = math.random(0, 0x7FF)
+      end
+    else
+      Uuid._counter = math.random(0, 0x7FF)
+    end
+
+    Uuid._lastTimestamp = timestamp
+    return new Uuid(string.format("%012x", timestamp) .. "7" .. string.format("%03x", Uuid._counter) .. randomVariant() .. randomHex(15))
+  end
+
+  --- Parses a UUID in canonical form, without dashes, in braces or as an urn. Returns nil if the text is not a valid UUID.
+  static function parse(text: string): Uuid?
+    local hex = string.lower(text)
+    hex = string.gsub(hex, "^urn:uuid:", "")
+    hex = string.gsub(hex, "^{(.*)}$", "%1")
+    if string.match(hex, "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil then
+      hex = string.gsub(hex, "%-", "")
+    end
+
+    if #hex ~= 32 or string.match(hex, "^%x+$") == nil then
+      return nil
+    end
+
+    return new Uuid(hex)
+  end
+
+  --- Returns whether the given text is a valid UUID.
+  static function isValid(text: string): boolean
+    return Uuid.parse(text) ~= nil
+  end
+
+  --- Returns the version of this UUID, for example 4 or 7.
+  function getVersion(): number
+    return tonumber(string.sub(self._hex, 13, 13), 16) ?? 0
+  end
+
+  --- Returns the unix timestamp in milliseconds of a version 7 UUID, or nil for other versions.
+  function getTimestamp(): number?
+    if self:getVersion() ~= 7 then
+      return nil
+    end
+
+    return tonumber(string.sub(self._hex, 1, 12), 16)
+  end
+
+  --- Returns whether this is the nil UUID.
+  function isNil(): boolean
+    return self._hex == "00000000000000000000000000000000"
+  end
+
+  --- Returns the canonical form like "0192a4e2-7b1c-7d3e-8f4a-1b2c3d4e5f60".
+  function toString(): string
+    local hex = self._hex
+    return string.sub(hex, 1, 8) .. "-" .. string.sub(hex, 9, 12) .. "-" .. string.sub(hex, 13, 16) .. "-" .. string.sub(hex, 17, 20) .. "-" .. string.sub(hex, 21, 32)
+  end
+
+  --- Returns the 32 hexadecimal characters without dashes.
+  function toCompactString(): string
+    return self._hex
+  end
+
+  --- Returns whether both UUIDs are equal.
+  function equals(other: Uuid): boolean
+    return self._hex == other:toCompactString()
+  end
+
+  --- Returns -1, 0 or 1 comparing both UUIDs lexicographically, which orders version 7 UUIDs by creation time.
+  function compareTo(other: Uuid): number
+    local otherHex = other:toCompactString()
+    if self._hex < otherHex then
+      return -1
+    elseif self._hex > otherHex then
+      return 1
+    end
+
+    return 0
+  end
+
+  function __tostring(): string
+    return self:toString()
+  end
+
+  operator ==(other: Uuid): boolean
+    return self:equals(other)
+  end
+
+  operator <(other: Uuid): boolean
+    return self:compareTo(other) < 0
+  end
+
+  operator <=(other: Uuid): boolean
+    return self:compareTo(other) <= 0
+  end
+end

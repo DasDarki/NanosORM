@@ -1,0 +1,15 @@
+import { Platform } from "../dbal/Platform"
+
+--- Maps a value of type T to a database column and back.
+export interface ColumnType<T>
+
+  --- Returns the SQL column type on the given platform, for example "VARCHAR(255)".
+  method getSqlType(platform: Platform): string
+
+  --- Converts the given value into a value that can be passed as a query parameter.
+  method toDatabase(value: T, platform: Platform): any
+
+  --- Converts a raw value read from the database into a value of type T. Returns nil if the value cannot be converted.
+  method fromDatabase(raw: any, platform: Platform): T?
+
+end

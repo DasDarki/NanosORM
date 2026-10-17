@@ -1,0 +1,81 @@
+local function canonicalize(value: any): string
+  local valueType = type(value)
+  if valueType == "table" then
+    local keys: any[] = {}
+    for key, _ in pairs(value) do
+      table.insert(keys, key)
+    end
+
+    table.sort(keys, function(left: any, right: any): boolean
+      return tostring(left) < tostring(right)
+    end)
+
+    local parts: string[] = {}
+    for index = 1, #keys do
+      local key = keys[index]
+      table.insert(parts, string.format("%q", tostring(key)) .. ":" .. canonicalize(value[key]))
+    end
+
+    return "{" .. table.concat(parts, ",") .. "}"
+  elseif valueType == "string" then
+    return string.format("%q", value)
+  elseif valueType == "number" then
+    return string.format("%.17g", value)
+  end
+
+  return tostring(value)
+end
+
+--- Holds a value that is stored as JSON, for example an inventory or settings table.
+--- Since changes inside the table cannot be observed, isDirty compares the current content with the last saved snapshot.
+export class Json<T>
+
+  local _value: T
+  local _snapshot: string = ""
+
+  --- Creates a JSON value. The value counts as changed until markClean is called.
+  constructor(value: T)
+    self._value = value
+  end
+
+  --- Parses a JSON string. Returns nil if the string is not valid JSON.
+  static function parse(text: string): Json<any>?
+    local success, value = pcall(JSON.parse, text)
+    if not success or value == nil then
+      return nil
+    end
+
+    local result = new Json(value)
+    result:markClean()
+    return result
+  end
+
+  --- Returns the value.
+  function get(): T
+    return self._value
+  end
+
+  --- Replaces the value.
+  function set(value: T): void
+    self._value = value
+  end
+
+  --- Returns whether the value was changed since the last call of markClean.
+  function isDirty(): boolean
+    return canonicalize(self._value) ~= self._snapshot
+  end
+
+  --- Marks the current value as saved.
+  function markClean(): void
+    self._snapshot = canonicalize(self._value)
+  end
+
+  --- Returns the value encoded as JSON.
+  function stringify(): string
+    return JSON.stringify(self._value)
+  end
+
+  function __tostring(): string
+    return self:stringify()
+  end
+end

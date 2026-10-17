@@ -1,0 +1,713 @@
+import { EntityMetadata, RelationMetadata, RelationKind, MetadataRegistry } from "./Metadata"
+import { Connection, QueryParams } from "../dbal/Connection"
+import { ChangeTracker } from "./ChangeTracker"
+import { EntityPersister } from "./EntityPersister"
+import { Collection } from "./Collection"
+import { Expr } from "./Expression"
+
+local BATCH_SIZE = 500
+
+local function parsePaths(paths: any): any
+  local tree: any = {}
+  if paths == nil then
+    return tree
+  end
+
+  local list: any = paths
+  if type(paths) == "string" then
+    list = { paths }
+  end
+
+  for _, path in ipairs(list) do
+    local node = tree
+    for part in string.gmatch(tostring(path), "[^%.]+") do
+      if node[part] == nil then
+        node[part] = {}
+      end
+
+      node = node[part]
+    end
+  end
+
+  return tree
+end
+
+local function expandEager(metadata: EntityMetadata, node: any, path: { [any]: boolean }): void
+  for _, relation in ipairs(metadata.relations) do
+    if relation.fetch == "eager" and node[relation.fieldName] == nil and not path[relation] then
+      local otherSide = relation:getOtherSide()
+      if otherSide == nil or not path[otherSide] then
+        node[relation.fieldName] = {}
+      end
+    end
+  end
+
+  for field, subtree in pairs(node) do
+    local relation = metadata:getRelation(field)
+    if relation ~= nil then
+      path[relation] = true
+      expandEager(relation:getTarget(), subtree, path)
+      path[relation] = nil
+    end
+  end
+end
+
+local function sortedKeys(tree: any): string[]
+  local keys: string[] = {}
+  for key, _ in pairs(tree) do
+    table.insert(keys, key as string)
+  end
+
+  table.sort(keys)
+  return keys
+end
+
+local function unique(list: any[]): any[]
+  local seen: { [any]: boolean } = {}
+  local result: any[] = {}
+  for index = 1, #list do
+    local item = list[index]
+    if item ~= nil and not seen[item] then
+      seen[item] = true
+      table.insert(result, item)
+    end
+  end
+
+  return result
+end
+
+local function chunk(list: any[], size: number): any[][]
+  local result: any[][] = {}
+  for start = 1, #list, size do
+    local part: any[] = {}
+    for index = start, math.min(start + size - 1, #list) do
+      table.insert(part, list[index])
+    end
+
+    table.insert(result, part)
+  end
+
+  return result
+end
+
+local function isEmptyTree(tree: any): boolean
+  return next(tree) == nil
+end
+
+--- Loads entities and their relations and keeps the identity map, so every row is represented by exactly one entity instance.
+---
+--- To-one relations requested with the with option are joined into the same query. To-many relations are loaded afterwards with one
+--- query per relation and level for all parents at once, which keeps the row count small and limit and offset correct.
+--- Owning to-one relations that are not requested become references, which only know their id until they are loaded.
+---
+--- The identity map holds entities weakly, so entities the game code does not reference anymore are garbage collected and long running
+--- servers do not keep every loaded row in memory. Entities with changes that were not flushed yet are pinned and kept until the flush.
+export class EntityLoader
+
+  local _connection: Connection
+  local _persisters: { [any]: EntityPersister } = {}
+  local _identityMap: { [any]: { [string]: any } } = {}
+  local _pinned: { [any]: boolean } = {}
+  local _loadListener: ((any) -> void)? = nil
+
+  constructor(connection: Connection)
+    self._connection = connection
+  end
+
+  --- Sets the function called with every entity after it was loaded from the database. The EntityManager uses it to run the postLoad
+  --- event, which also calls the onPostLoad method of the entity.
+  function setLoadListener(listener: ((any) -> void)?): void
+    self._loadListener = listener
+  end
+
+  --- Returns the persister of the given metadata.
+  function getPersister(metadata: EntityMetadata): EntityPersister
+    local persister = self._persisters[metadata]
+    if persister == nil then
+      persister = new EntityPersister(metadata, self._connection)
+      self._persisters[metadata] = persister
+    end
+
+    return persister
+  end
+
+  --- Returns the entity with the given identity key, if it is known.
+  function lookup(metadata: EntityMetadata, key: string): any
+    local entities = self._identityMap[metadata:getRootMetadata()]
+    if entities == nil then
+      return nil
+    end
+
+    return entities[key]
+  end
+
+  --- Returns the identity key of an entity, or nil if it has no id yet.
+  function keyOf(metadata: EntityMetadata, entity: any): string?
+    local id = entity[metadata:getIdColumn().fieldName]
+    if id == nil then
+      return nil
+    end
+
+    return self:getPersister(metadata):identityKey(id)
+  end
+
+  --- Adds an entity with an id to the identity map.
+  function register(metadata: EntityMetadata, entity: any): void
+    local key = self:keyOf(metadata, entity)
+    if key == nil then
+      error("Cannot register an entity without id", 2)
+    end
+
+    local root = metadata:getRootMetadata()
+    if self._identityMap[root] == nil then
+      self._identityMap[root] = setmetatable({}, { __mode = "v" })
+    end
+
+    self._identityMap[root][key] = entity
+    ChangeTracker.setListener(entity, function(changed: any): void
+      self:pin(changed)
+    end)
+  end
+
+  --- Keeps an entity in memory until it is unpinned, for example because it has changes that were not flushed yet.
+  function pin(entity: any): void
+    self._pinned[entity] = true
+  end
+
+  --- Releases an entity pinned with pin, so the identity map only holds it weakly again.
+  function unpin(entity: any): void
+    self._pinned[entity] = nil
+  end
+
+  --- Returns whether the entity is pinned.
+  function isPinned(entity: any): boolean
+    return self._pinned[entity] == true
+  end
+
+  --- Removes an entity from the identity map.
+  function unregister(metadata: EntityMetadata, entity: any): void
+    local key = self:keyOf(metadata, entity)
+    local entities = self._identityMap[metadata:getRootMetadata()]
+    if key ~= nil and entities ~= nil and entities[key] == entity then
+      entities[key] = nil
+    end
+
+    self:unpin(entity)
+  end
+
+  --- Returns whether the entity is the registered instance for its id.
+  function isRegistered(metadata: EntityMetadata, entity: any): boolean
+    local key = self:keyOf(metadata, entity)
+    return key ~= nil and self:lookup(metadata, key) == entity
+  end
+
+  --- Returns all entities of the identity map.
+  function getManagedEntities(): any[]
+    local result: any[] = {}
+    for _, entities in pairs(self._identityMap) do
+      for _, entity in pairs(entities) do
+        table.insert(result, entity)
+      end
+    end
+
+    return result
+  end
+
+  --- Empties the identity map and returns the entities it held.
+  function clear(): any[]
+    local entities = self:getManagedEntities()
+    self._identityMap = {}
+    self._pinned = {}
+    return entities
+  end
+
+  --- Returns the managed entity for the id. Unknown ids get an uninitialized reference that only knows its id until it is loaded.
+  function getReference(metadata: EntityMetadata, id: any): any
+    local persister = self:getPersister(metadata)
+    local normalized = persister:normalizeId(id)
+    local key = persister:identityKey(normalized)
+    local known = self:lookup(metadata, key)
+    if known ~= nil then
+      return known
+    end
+
+    local entity: any = setmetatable({}, metadata.entityClass)
+    rawset(entity, metadata:getIdColumn().fieldName, normalized)
+    self:attachCollections(metadata, entity, false)
+    ChangeTracker.manage(entity, metadata, false)
+    self:register(metadata, entity)
+    return entity
+  end
+
+  --- Gives every to-many field of an entity a collection bound to it. Existing collections are kept and bound, arrays are wrapped.
+  function attachCollections(metadata: EntityMetadata, entity: any, initialized: boolean): void
+    for index = 1, #metadata.relations do
+      local relation = metadata.relations[index]
+      if relation:isToMany() then
+        local current: any = rawget(entity, relation.fieldName)
+        if current == nil and ChangeTracker.isManaged(entity) then
+          current = entity[relation.fieldName]
+        end
+
+        local collection: any = current
+        if not Collection.isCollection(current) then
+          collection = new Collection(current)
+          collection:bind(entity, relation, initialized or current ~= nil)
+        else
+          collection:bind(entity, relation, current:isInitialized())
+        end
+
+        if ChangeTracker.isManaged(entity) then
+          ChangeTracker.setClean(entity, relation.fieldName, collection)
+        else
+          rawset(entity, relation.fieldName, collection)
+        end
+      end
+    end
+  end
+
+  --- Creates or completes the entity stored in a row under the given alias, or under the plain column names without alias, and returns it.
+  --- Known initialized entities are returned unchanged.
+  function hydrate(queried: EntityMetadata, row: any, alias: string?): any
+    local metadata = self:getPersister(queried):resolveRowMetadata(row, alias)
+    local persister = self:getPersister(metadata)
+    local data = persister:readRow(row, alias)
+    if data == nil then
+      return nil
+    end
+
+    local known = self:lookup(metadata, data.key)
+    if known ~= nil and ChangeTracker.isInitialized(known) then
+      return known
+    end
+
+    local values = data.values
+    for index = 1, #metadata.relations do
+      local relation = metadata.relations[index]
+      if relation:hasJoinColumn() then
+        local foreignKey = data.foreignKeys[relation.fieldName]
+        if foreignKey ~= nil then
+          values[relation.fieldName] = self:getReference(relation:getTarget(), foreignKey)
+        end
+      end
+    end
+
+    known = self:lookup(metadata, data.key)
+    local entity: any = known
+    if known ~= nil then
+      if MetadataRegistry.ofEntity(known) ~= metadata then
+        ChangeTracker.retype(known, metadata)
+        self:attachCollections(metadata, known, false)
+      end
+
+      ChangeTracker.initialize(known, values)
+    else
+      entity = setmetatable({}, metadata.entityClass)
+      for key, value in pairs(values) do
+        rawset(entity, key, value)
+      end
+
+      self:attachCollections(metadata, entity, false)
+      ChangeTracker.manage(entity, metadata)
+      self:register(metadata, entity)
+    end
+
+    local loadListener = self._loadListener
+    if loadListener ~= nil then
+      loadListener(entity)
+    end
+
+    return entity
+  end
+
+  --- Reloads an entity and overwrites its columns and owning relations with the stored values, also with values that became NULL.
+  --- Pending changes of these fields are discarded. Collections keep their state.
+  function refresh(metadata: EntityMetadata, entity: any, callback: (boolean, string?) -> void): void
+    local persister = self:getPersister(metadata)
+    local criteria: any = {}
+    criteria[metadata:getIdColumn().fieldName] = entity[metadata:getIdColumn().fieldName]
+    local sql, params = persister:buildSelect(criteria, { withDeleted = true, limit = 1 })
+    self._connection:select(sql, params, function(rows: any[]?, err: string?): void
+      if rows == nil then
+        callback(false, err)
+        return
+      end
+
+      local row = rows[1]
+      if row == nil then
+        callback(false, "The '" .. metadata.className .. "' does not exist anymore")
+        return
+      end
+
+      local data = persister:readRow(row, persister:getRootAlias())
+      for _, column in ipairs(metadata.columns) do
+        ChangeTracker.setClean(entity, column.fieldName, data.values[column.fieldName])
+      end
+
+      for _, embedded in ipairs(metadata.embeddeds) do
+        ChangeTracker.setClean(entity, embedded.fieldName, data.values[embedded.fieldName])
+      end
+
+      for _, relation in ipairs(metadata.relations) do
+        if relation:hasJoinColumn() then
+          local foreignKey = data.foreignKeys[relation.fieldName]
+          ChangeTracker.setClean(entity, relation.fieldName, foreignKey ~= nil and self:getReference(relation:getTarget(), foreignKey) or nil)
+        end
+      end
+
+      ChangeTracker.markInitialized(entity)
+      callback(true, nil)
+    end)
+  end
+
+  --- Finds the entities matching the criteria. The with option names relations to load as paths, for example { "owner", "houses.rooms" }.
+  --- Eager relations are added to them, unless the eager option is false.
+  function query(metadata: EntityMetadata, criteria: any, options: any, callback: (any[]?, string?) -> void): void
+    local tree = parsePaths(options ~= nil and options.with or nil)
+    if options == nil or options.eager ~= false then
+      expandEager(metadata, tree, {})
+    end
+
+    self:runQuery(metadata, criteria, options, nil, tree, function(result: any): void
+      if result.error ~= nil then
+        callback(nil, result.error)
+      else
+        callback(result.entities, nil)
+      end
+    end)
+  end
+
+  --- Loads relations of already loaded entities, given as single entity or array, for example load(users, { "houses", "guild" }).
+  --- Collections and references that are loaded already are not queried again.
+  function load(entities: any, paths: any, callback: (boolean, string?) -> void): void
+    local list: any[] = {}
+    if MetadataRegistry.ofEntity(entities) ~= nil then
+      list = { entities }
+    elseif type(entities) == "table" then
+      list = entities
+    end
+
+    local tree = parsePaths(paths)
+    for field, subtree in pairs(tree) do
+      for _, entity in ipairs(list) do
+        local metadata = MetadataRegistry.ofEntity(entity)
+        local relation = metadata ~= nil and metadata:getRelation(field) or nil
+        if relation ~= nil then
+          local path: { [any]: boolean } = {}
+          path[relation] = true
+          expandEager(relation:getTarget(), subtree, path)
+          break
+        end
+      end
+    end
+
+    self:loadTree(unique(list), tree, function(err: string?): void
+      callback(err == nil, err)
+    end)
+  end
+
+  local async function runQuery(metadata: EntityMetadata, criteria: any, options: any, extra: any, tree: any): any
+    local persister = self:getPersister(metadata)
+    local joins: any[] = {}
+    local deferred: any[] = {}
+    local joinSql: string[] = {}
+    local joinColumns: string[] = {}
+    local counter = 0
+    local function plan(current: EntityMetadata, alias: string, node: any): void
+      local currentPersister = self:getPersister(current)
+      for _, field in ipairs(sortedKeys(node)) do
+        local relation = current:getRelation(field)
+        if relation == nil then
+          error("'" .. current.className .. "' has no relation '" .. field .. "'", 6)
+        end
+
+        local subtree = node[field]
+        if relation:isToOne() then
+          counter = counter + 1
+          local joinAlias = "t" .. counter
+          local target = relation:getTarget()
+          local targetPersister = self:getPersister(target)
+          local condition = ""
+          if relation:hasJoinColumn() then
+            condition = targetPersister:qualify(joinAlias, target:getIdColumn().columnName) .. " = " .. currentPersister:qualify(alias, relation:getJoinColumn().columnName)
+          else
+            condition = targetPersister:qualify(joinAlias, relation:getMappedRelation():getJoinColumn().columnName) .. " = " .. currentPersister:qualify(alias, current:getIdColumn().columnName)
+          end
+
+          table.insert(joinSql, "LEFT JOIN " .. self._connection:quote(target.tableName) .. " " .. joinAlias .. " ON " .. condition)
+          for _, column in ipairs(targetPersister:getSelectColumns(joinAlias)) do
+            table.insert(joinColumns, column)
+          end
+
+          table.insert(joins, { alias = joinAlias, parentAlias = alias, metadata = target, relation = relation })
+          plan(target, joinAlias, subtree)
+        else
+          table.insert(deferred, { alias = alias, relation = relation, subtree = subtree })
+        end
+      end
+    end
+
+    plan(metadata, persister:getRootAlias(), tree)
+
+    local aliases: { [string]: string } = {}
+    for _, join in ipairs(joins) do
+      aliases[join.parentAlias .. "." .. join.relation.fieldName] = join.alias
+    end
+
+    local merged: any = { joins = table.concat(joinSql, " "), columns = joinColumns, where = nil, aliases = aliases }
+    if extra ~= nil then
+      if extra.joins ~= nil then
+        merged.joins = extra.joins .. " " .. merged.joins
+      end
+
+      for _, column in ipairs(extra.columns ?? {}) do
+        table.insert(merged.columns, column)
+      end
+
+      merged.where = extra.where
+    end
+
+    local sql, params = persister:buildSelect(criteria, options, merged)
+    local rows, err = await self._connection:select(sql, params)
+    if rows == nil then
+      return { error = err }
+    end
+
+    local roots: any[] = {}
+    local byAlias: { [string]: any[] } = {}
+    local hydrated, failure = pcall(function(): void
+      for _, row in ipairs(rows) do
+        local rowEntities: { [string]: any } = {}
+        for index = #joins, 1, -1 do
+          local join = joins[index]
+          rowEntities[join.alias] = self:hydrate(join.metadata, row, join.alias)
+        end
+
+        local root = self:hydrate(metadata, row, persister:getRootAlias())
+        rowEntities[persister:getRootAlias()] = root
+        table.insert(roots, root)
+        for _, join in ipairs(joins) do
+          local parent = rowEntities[join.parentAlias]
+          if parent ~= nil and not join.relation:hasJoinColumn() then
+            ChangeTracker.setClean(parent, join.relation.fieldName, rowEntities[join.alias])
+          end
+        end
+
+        for alias, entity in pairs(rowEntities) do
+          if byAlias[alias] == nil then
+            byAlias[alias] = {}
+          end
+
+          table.insert(byAlias[alias], entity)
+        end
+      end
+    end)
+
+    if not hydrated then
+      return { error = tostring(failure) }
+    end
+
+    for _, item in ipairs(deferred) do
+      local parents = unique(byAlias[item.alias] ?? {})
+      if #parents > 0 then
+        local loadErr = await self:loadRelation(parents, item.relation, item.subtree)
+        if loadErr ~= nil then
+          return { error = loadErr }
+        end
+      end
+    end
+
+    return { entities = unique(roots), roots = roots, rows = rows }
+  end
+
+  local async function loadTree(entities: any[], tree: any): string?
+    for _, field in ipairs(sortedKeys(tree)) do
+      local groups: { [any]: any[] } = {}
+      local order: any[] = {}
+      for _, entity in ipairs(entities) do
+        local metadata = MetadataRegistry.ofEntity(entity)
+        if metadata == nil then
+          return "Cannot load relations of an object that is not a mapped entity"
+        end
+
+        local relation = metadata:getRelation(field)
+        if relation == nil then
+          return "'" .. metadata.className .. "' has no relation '" .. field .. "'"
+        end
+
+        if groups[relation] == nil then
+          groups[relation] = {}
+          table.insert(order, relation)
+        end
+
+        table.insert(groups[relation], entity)
+      end
+
+      for _, relation in ipairs(order) do
+        local err = await self:loadRelation(groups[relation], relation as RelationMetadata, tree[field])
+        if err ~= nil then
+          return err
+        end
+      end
+    end
+
+    return nil
+  end
+
+  local async function loadRelation(parents: any[], relation: RelationMetadata, subtree: any): string?
+    local target = relation:getTarget()
+    local loadedBefore: any[] = {}
+    if relation:hasJoinColumn() then
+      local ids: any[] = {}
+      local idField = target:getIdColumn().fieldName
+      for _, parent in ipairs(parents) do
+        local reference = parent[relation.fieldName]
+        if reference ~= nil then
+          if ChangeTracker.isInitialized(reference) then
+            table.insert(loadedBefore, reference)
+          else
+            table.insert(ids, reference[idField])
+          end
+        end
+      end
+
+      for _, part in ipairs(chunk(unique(ids), BATCH_SIZE)) do
+        local criteria: any = {}
+        criteria[idField] = Expr.isIn(part)
+        local result = await self:runQuery(target, criteria, { withDeleted = true }, nil, subtree)
+        if result.error ~= nil then
+          return result.error
+        end
+      end
+    elseif relation.kind == RelationKind.OneToOne then
+      local owningField = relation:getMappedRelation().fieldName
+      local found: { [any]: any } = {}
+      for _, part in ipairs(chunk(parents, BATCH_SIZE)) do
+        local criteria: any = {}
+        criteria[owningField] = Expr.isIn(part)
+        local result = await self:runQuery(target, criteria, nil, nil, subtree)
+        if result.error ~= nil then
+          return result.error
+        end
+
+        for _, child in ipairs(result.entities) do
+          local owner = child[owningField]
+          if owner ~= nil then
+            found[owner] = child
+          end
+        end
+      end
+
+      for _, parent in ipairs(parents) do
+        ChangeTracker.setClean(parent, relation.fieldName, found[parent])
+      end
+    else
+      local pending: any[] = {}
+      for _, parent in ipairs(parents) do
+        local collection = parent[relation.fieldName]
+        if Collection.isCollection(collection) and not collection:isInitialized() then
+          table.insert(pending, parent)
+        elseif Collection.isCollection(collection) then
+          for _, item in ipairs(collection:toArray()) do
+            table.insert(loadedBefore, item)
+          end
+        end
+      end
+
+      local groups: { [any]: any[] } = {}
+      local err: string? = nil
+      if relation.kind == RelationKind.OneToMany then
+        err = await self:loadOneToMany(pending, relation, subtree, groups)
+      else
+        err = await self:loadManyToMany(pending, relation, subtree, groups)
+      end
+
+      if err ~= nil then
+        return err
+      end
+
+      for _, parent in ipairs(pending) do
+        parent[relation.fieldName]:initialize(groups[parent] ?? {})
+      end
+    end
+
+    if #loadedBefore > 0 and not isEmptyTree(subtree) then
+      return await self:loadTree(unique(loadedBefore), subtree)
+    end
+
+    return nil
+  end
+
+  local async function loadOneToMany(parents: any[], relation: RelationMetadata, subtree: any, groups: { [any]: any[] }): string?
+    local owningField = relation:getMappedRelation().fieldName
+    local target = relation:getTarget()
+    for _, part in ipairs(chunk(parents, BATCH_SIZE)) do
+      local criteria: any = {}
+      criteria[owningField] = Expr.isIn(part)
+      local result = await self:runQuery(target, criteria, { orderBy = relation.orderBy }, nil, subtree)
+      if result.error ~= nil then
+        return result.error
+      end
+
+      for _, child in ipairs(result.entities) do
+        local owner = child[owningField]
+        if owner ~= nil then
+          if groups[owner] == nil then
+            groups[owner] = {}
+          end
+
+          table.insert(groups[owner], child)
+        end
+      end
+    end
+
+    return nil
+  end
+
+  local async function loadManyToMany(parents: any[], relation: RelationMetadata, subtree: any, groups: { [any]: any[] }): string?
+    local target = relation:getTarget()
+    local owner = relation:getOwner()
+    local ownerPersister = self:getPersister(owner)
+    local targetPersister = self:getPersister(target)
+    local joinTable = self._connection:quote(relation:getJoinTableName())
+    local selfColumn = "j." .. self._connection:quote(relation:getSelfJoinTableColumn())
+    local targetColumn = "j." .. self._connection:quote(relation:getTargetJoinTableColumn())
+    local ownerIdField = owner:getIdColumn().fieldName
+    for _, part in ipairs(chunk(parents, BATCH_SIZE)) do
+      local byKey: { [string]: any } = {}
+      for _, parent in ipairs(part) do
+        byKey[ownerPersister:identityKey(parent[ownerIdField])] = parent
+      end
+
+      local extra: any = {
+        joins = "INNER JOIN " .. joinTable .. " j ON " .. targetColumn .. " = " .. targetPersister:qualify(targetPersister:getRootAlias(), target:getIdColumn().columnName),
+        columns = { selfColumn .. " AS " .. self._connection:quote("__owner") },
+        where = function(params: QueryParams): string
+          local placeholders: string[] = {}
+          for _, parent in ipairs(part) do
+            table.insert(placeholders, params:add(ownerPersister:toDatabaseValue(owner:getIdColumn(), parent[ownerIdField])))
+          end
+
+          return selfColumn .. " IN (" .. table.concat(placeholders, ", ") .. ")"
+        end
+      }
+      local result = await self:runQuery(target, nil, { orderBy = relation.orderBy }, extra, subtree)
+      if result.error ~= nil then
+        return result.error
+      end
+
+      for index, row in ipairs(result.rows) do
+        local parent = byKey[ownerPersister:identityKey(row.__owner)]
+        if parent ~= nil then
+          if groups[parent] == nil then
+            groups[parent] = {}
+          end
+
+          table.insert(groups[parent], result.roots[index])
+        end
+      end
+    end
+
+    return nil
+  end
+end

@@ -1,0 +1,410 @@
+import { Calendar, DayOfWeek } from "./Calendar"
+
+local MS_PER_MINUTE = 60000
+local MS_PER_DAY = 86400000
+
+local function pad(value: number, width: number): string
+  return string.format("%0" .. width .. "d", value)
+end
+
+--- Defines how the time of a daylight saving transition has to be interpreted.
+export enum TransitionTimeMode
+  Utc = 0
+  Standard = 1
+  Wall = 2
+end
+
+--- Describes the point in time a daylight saving transition happens within a year, for example "the last Sunday of March at 01:00 UTC".
+export class TransitionRule
+
+  --- The month of the transition, from 1 to 12.
+  month: number
+
+  --- The occurrence of the weekday within the month, from 1 to 4, or -1 for the last occurrence.
+  week: number
+
+  --- The weekday the transition happens on.
+  dayOfWeek: DayOfWeek
+
+  --- The time of day of the transition in minutes after midnight.
+  timeMinutes: number
+
+  --- Defines whether the time is meant in UTC, in standard time or in the wall clock time before the transition.
+  mode: TransitionTimeMode
+
+  constructor(month: number, week: number, dayOfWeek: DayOfWeek, timeMinutes: number, mode: TransitionTimeMode)
+    self.month = month
+    self.week = week
+    self.dayOfWeek = dayOfWeek
+    self.timeMinutes = timeMinutes
+    self.mode = mode
+  end
+
+  --- Returns the day of the transition in the given year as days since the unix epoch.
+  function getDay(year: number): number
+    local target = self.dayOfWeek as number
+    if self.week < 0 then
+      local last = Calendar.daysFromCivil(year, self.month, Calendar.daysInMonth(year, self.month))
+      return last - (Calendar.weekdayFromDays(last) - target) % 7
+    end
+
+    local first = Calendar.daysFromCivil(year, self.month, 1)
+    return first + (target - Calendar.weekdayFromDays(first)) % 7 + (self.week - 1) * 7
+  end
+
+  --- Returns the transition in the given year as UTC epoch milliseconds, using the given offsets in minutes.
+  function getEpoch(year: number, standardOffset: number, wallOffset: number): number
+    local localMs = self:getDay(year) * MS_PER_DAY + self.timeMinutes * MS_PER_MINUTE
+    if self.mode == TransitionTimeMode.Standard then
+      return localMs - standardOffset * MS_PER_MINUTE
+    elseif self.mode == TransitionTimeMode.Wall then
+      return localMs - wallOffset * MS_PER_MINUTE
+    end
+
+    return localMs
+  end
+end
+
+--- Describes when daylight saving time starts and ends and how many minutes the clock is shifted.
+export class DaylightSavingRule
+
+  --- The rule used in the European Union and the United Kingdom.
+  static EU: DaylightSavingRule = new DaylightSavingRule(
+    new TransitionRule(3, -1, DayOfWeek.Sunday, 60, TransitionTimeMode.Utc),
+    new TransitionRule(10, -1, DayOfWeek.Sunday, 60, TransitionTimeMode.Utc),
+    60
+  )
+
+  --- The rule used in the United States and Canada.
+  static US: DaylightSavingRule = new DaylightSavingRule(
+    new TransitionRule(3, 2, DayOfWeek.Sunday, 120, TransitionTimeMode.Wall),
+    new TransitionRule(11, 1, DayOfWeek.Sunday, 120, TransitionTimeMode.Wall),
+    60
+  )
+
+  --- The rule used in the south eastern states of Australia.
+  static AU: DaylightSavingRule = new DaylightSavingRule(
+    new TransitionRule(10, 1, DayOfWeek.Sunday, 120, TransitionTimeMode.Standard),
+    new TransitionRule(4, 1, DayOfWeek.Sunday, 120, TransitionTimeMode.Standard),
+    60
+  )
+
+  --- The rule used in New Zealand.
+  static NZ: DaylightSavingRule = new DaylightSavingRule(
+    new TransitionRule(9, -1, DayOfWeek.Sunday, 120, TransitionTimeMode.Standard),
+    new TransitionRule(4, 1, DayOfWeek.Sunday, 120, TransitionTimeMode.Standard),
+    60
+  )
+
+  --- The transition into daylight saving time.
+  startRule: TransitionRule
+
+  --- The transition back into standard time.
+  endRule: TransitionRule
+
+  --- The amount of minutes the clock is shifted during daylight saving time.
+  savings: number
+
+  constructor(startRule: TransitionRule, endRule: TransitionRule, savings: number = 60)
+    self.startRule = startRule
+    self.endRule = endRule
+    self.savings = savings
+  end
+
+  --- Returns the start and the end of daylight saving time in the given year as UTC epoch milliseconds.
+  function getTransitions(year: number, standardOffset: number): (number, number)
+    local daylightOffset = standardOffset + self.savings
+    local startEpoch = self.startRule:getEpoch(year, standardOffset, standardOffset)
+    local endEpoch = self.endRule:getEpoch(year, standardOffset, daylightOffset)
+    return startEpoch, endEpoch
+  end
+end
+
+--- A time zone with a standard offset to UTC and an optional daylight saving rule.
+export class TimeZone
+
+  --- The UTC time zone.
+  static UTC: TimeZone = new TimeZone("UTC", 0, nil, "UTC", "UTC")
+
+  local static _registry: { [string]: TimeZone } = {}
+  local static _default: TimeZone = TimeZone.UTC
+
+  local _id: string = ""
+  local _standardOffset: number = 0
+  local _rule: DaylightSavingRule? = nil
+  local _standardName: string = ""
+  local _daylightName: string = ""
+
+  --- Creates a new time zone. The offset is given in minutes east of UTC.
+  constructor(id: string, standardOffset: number, rule: DaylightSavingRule? = nil, standardName: string? = nil, daylightName: string? = nil)
+    self._id = id
+    self._standardOffset = standardOffset
+    self._rule = rule
+    self._standardName = standardName ?? TimeZone.formatOffset(standardOffset, true)
+    self._daylightName = daylightName ?? self._standardName
+  end
+
+  --- Returns the identifier of this time zone, for example "Europe/Berlin".
+  function getId(): string
+    return self._id
+  end
+
+  --- Returns the standard offset of this time zone in minutes east of UTC.
+  function getStandardOffset(): number
+    return self._standardOffset
+  end
+
+  --- Returns the daylight saving rule of this time zone, if it has one.
+  function getRule(): DaylightSavingRule?
+    return self._rule
+  end
+
+  --- Returns whether this time zone observes daylight saving time.
+  function hasDaylightSaving(): boolean
+    return self._rule ~= nil
+  end
+
+  --- Returns whether daylight saving time is active at the given UTC epoch milliseconds.
+  function isDaylightSaving(epoch: number): boolean
+    local rule = self._rule
+    if rule == nil then
+      return false
+    end
+
+    local localDays = (epoch + self._standardOffset * MS_PER_MINUTE) // MS_PER_DAY
+    local year = Calendar.civilFromDays(localDays)
+    local startEpoch, endEpoch = rule:getTransitions(year, self._standardOffset)
+    if startEpoch < endEpoch then
+      return epoch >= startEpoch and epoch < endEpoch
+    end
+
+    return epoch >= startEpoch or epoch < endEpoch
+  end
+
+  --- Returns the offset to UTC in minutes at the given UTC epoch milliseconds.
+  function getOffset(epoch: number): number
+    local rule = self._rule
+    if rule ~= nil and self:isDaylightSaving(epoch) then
+      return self._standardOffset + rule.savings
+    end
+
+    return self._standardOffset
+  end
+
+  --- Returns the abbreviation of this time zone at the given UTC epoch milliseconds, for example "CET" or "CEST".
+  function getName(epoch: number): string
+    if self:isDaylightSaving(epoch) then
+      return self._daylightName
+    end
+
+    return self._standardName
+  end
+
+  --- Returns the abbreviation used during standard time.
+  function getStandardName(): string
+    return self._standardName
+  end
+
+  --- Returns the abbreviation used during daylight saving time.
+  function getDaylightName(): string
+    return self._daylightName
+  end
+
+  --- Converts local wall clock milliseconds into UTC epoch milliseconds. Ambiguous times resolve to the earlier instant and skipped times are shifted forward.
+  function toUtcEpoch(localMs: number): number
+    local rule = self._rule
+    local standardEpoch = localMs - self._standardOffset * MS_PER_MINUTE
+    if rule == nil then
+      return standardEpoch
+    end
+
+    local daylightOffset = self._standardOffset + rule.savings
+    local daylightEpoch = localMs - daylightOffset * MS_PER_MINUTE
+    if self:getOffset(daylightEpoch) == daylightOffset then
+      return daylightEpoch
+    end
+
+    return standardEpoch
+  end
+
+  --- Returns whether this time zone has the same identifier as the given one.
+  function equals(other: TimeZone): boolean
+    return self._id == other:getId()
+  end
+
+  function __tostring(): string
+    return self._id
+  end
+
+  --- Formats an offset in minutes as "+02:00" or "+0200".
+  static function formatOffset(offset: number, withColon: boolean = true): string
+    local sign = offset < 0 and "-" or "+"
+    local separator = withColon and ":" or ""
+    local absolute = math.abs(offset)
+    return sign .. pad(absolute // 60, 2) .. separator .. pad(absolute % 60, 2)
+  end
+
+  --- Returns a time zone with a fixed offset in minutes east of UTC and without daylight saving time.
+  static function fixed(offset: number): TimeZone
+    if offset == 0 then
+      return TimeZone.UTC
+    end
+
+    local id = TimeZone.formatOffset(offset, true)
+    return new TimeZone(id, offset, nil, id, id)
+  end
+
+  --- Registers a time zone so it can be resolved with TimeZone.of.
+  static function register(zone: TimeZone): void
+    TimeZone._registry[zone:getId()] = zone
+  end
+
+  --- Resolves a time zone by its identifier, for example "Europe/Berlin", or by an offset like "+02:00", "UTC+2" or "Z".
+  static function of(id: string): TimeZone?
+    local registered = TimeZone._registry[id]
+    if registered ~= nil then
+      return registered
+    end
+
+    local upper = string.upper(id)
+    if upper == "Z" or upper == "UTC" or upper == "GMT" then
+      return TimeZone.UTC
+    end
+
+    local text = id
+    if string.sub(upper, 1, 3) == "UTC" or string.sub(upper, 1, 3) == "GMT" then
+      text = string.sub(id, 4)
+    end
+
+    local sign, hours, minutes = string.match(text, "^([+-])(%d%d?):?(%d%d)$")
+    if sign == nil then
+      sign, hours = string.match(text, "^([+-])(%d%d?)$")
+      minutes = "0"
+    end
+
+    if sign == nil or hours == nil or minutes == nil then
+      return nil
+    end
+
+    local hourValue = tonumber(hours) ?? 0
+    local minuteValue = tonumber(minutes) ?? 0
+    if hourValue > 18 or minuteValue > 59 then
+      return nil
+    end
+
+    local offset = hourValue * 60 + minuteValue
+    return TimeZone.fixed(sign == "-" and -offset or offset)
+  end
+
+  --- Finds a registered time zone by its standard or daylight abbreviation, for example "CEST".
+  static function fromAbbreviation(name: string): TimeZone?
+    local upper = string.upper(name)
+    if upper == "UTC" or upper == "GMT" or upper == "Z" then
+      return TimeZone.UTC
+    end
+
+    for _, zone in pairs(TimeZone._registry) do
+      local candidate = zone as TimeZone
+      if string.upper(candidate:getStandardName()) == upper or string.upper(candidate:getDaylightName()) == upper then
+        return candidate
+      end
+    end
+
+    return nil
+  end
+
+  --- Returns the offset in minutes the given abbreviation of this zone stands for.
+  function getOffsetOfName(name: string): number
+    local rule = self._rule
+    if rule ~= nil and string.upper(name) == string.upper(self._daylightName) and self._daylightName ~= self._standardName then
+      return self._standardOffset + rule.savings
+    end
+
+    return self._standardOffset
+  end
+
+  --- Returns the identifiers of all registered time zones in alphabetical order.
+  static function getAvailableIds(): string[]
+    local ids: string[] = {}
+    for id, _ in pairs(TimeZone._registry) do
+      table.insert(ids, id as string)
+    end
+
+    table.sort(ids)
+    return ids
+  end
+
+  --- Returns the time zone used when no time zone is given explicitly. Defaults to UTC.
+  static function getDefault(): TimeZone
+    return TimeZone._default
+  end
+
+  --- Sets the time zone used when no time zone is given explicitly.
+  static function setDefault(zone: TimeZone): void
+    TimeZone._default = zone
+  end
+end
+
+local function registerZone(id: string, offset: number, rule: DaylightSavingRule?, standardName: string, daylightName: string? = nil): void
+  TimeZone.register(new TimeZone(id, offset, rule, standardName, daylightName))
+end
+
+TimeZone.register(TimeZone.UTC)
+registerZone("Europe/London", 0, DaylightSavingRule.EU, "GMT", "BST")
+registerZone("Europe/Dublin", 0, DaylightSavingRule.EU, "GMT", "IST")
+registerZone("Europe/Lisbon", 0, DaylightSavingRule.EU, "WET", "WEST")
+registerZone("Europe/Berlin", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Vienna", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Zurich", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Paris", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Amsterdam", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Brussels", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Luxembourg", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Rome", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Madrid", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Copenhagen", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Oslo", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Stockholm", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Warsaw", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Prague", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Budapest", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Belgrade", 60, DaylightSavingRule.EU, "CET", "CEST")
+registerZone("Europe/Athens", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Helsinki", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Kyiv", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Bucharest", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Sofia", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Riga", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Vilnius", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Tallinn", 120, DaylightSavingRule.EU, "EET", "EEST")
+registerZone("Europe/Istanbul", 180, nil, "TRT")
+registerZone("Europe/Moscow", 180, nil, "MSK")
+registerZone("America/New_York", -300, DaylightSavingRule.US, "EST", "EDT")
+registerZone("America/Toronto", -300, DaylightSavingRule.US, "EST", "EDT")
+registerZone("America/Chicago", -360, DaylightSavingRule.US, "CST", "CDT")
+registerZone("America/Denver", -420, DaylightSavingRule.US, "MST", "MDT")
+registerZone("America/Phoenix", -420, nil, "MST")
+registerZone("America/Los_Angeles", -480, DaylightSavingRule.US, "PST", "PDT")
+registerZone("America/Vancouver", -480, DaylightSavingRule.US, "PST", "PDT")
+registerZone("America/Anchorage", -540, DaylightSavingRule.US, "AKST", "AKDT")
+registerZone("America/Mexico_City", -360, nil, "CST")
+registerZone("America/Sao_Paulo", -180, nil, "BRT")
+registerZone("America/Argentina/Buenos_Aires", -180, nil, "ART")
+registerZone("Pacific/Honolulu", -600, nil, "HST")
+registerZone("Asia/Dubai", 240, nil, "GST")
+registerZone("Asia/Kolkata", 330, nil, "IST")
+registerZone("Asia/Bangkok", 420, nil, "ICT")
+registerZone("Asia/Jakarta", 420, nil, "WIB")
+registerZone("Asia/Shanghai", 480, nil, "CST")
+registerZone("Asia/Hong_Kong", 480, nil, "HKT")
+registerZone("Asia/Singapore", 480, nil, "SGT")
+registerZone("Asia/Tokyo", 540, nil, "JST")
+registerZone("Asia/Seoul", 540, nil, "KST")
+registerZone("Australia/Perth", 480, nil, "AWST")
+registerZone("Australia/Adelaide", 570, DaylightSavingRule.AU, "ACST", "ACDT")
+registerZone("Australia/Brisbane", 600, nil, "AEST")
+registerZone("Australia/Sydney", 600, DaylightSavingRule.AU, "AEST", "AEDT")
+registerZone("Australia/Melbourne", 600, DaylightSavingRule.AU, "AEST", "AEDT")
+registerZone("Pacific/Auckland", 720, DaylightSavingRule.NZ, "NZST", "NZDT")
+registerZone("Africa/Johannesburg", 120, nil, "SAST")
+registerZone("Africa/Cairo", 120, nil, "EET")

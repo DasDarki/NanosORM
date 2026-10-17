@@ -1,0 +1,9 @@
+version = 1
+
+[[packages]]
+name = "nanos-world-types"
+spec = "github:nebra-lang/nanos-world-types"
+resolved = "github:nebra-lang/nanos-world-types"
+commit = "912d8046f0271b6a38cec733511f98a488b1ee55"
+integrity = "sha256-9c9f236f61cf4bd558338b8ad1a4eed138a184766d7da4e6f8b39a3c807831fd"
+deps = []

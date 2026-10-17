@@ -1,0 +1,563 @@
+import { EntityManager } from "./EntityManager"
+import { Connection } from "../dbal/Connection"
+import { DateTime, StringDateFormat } from "../types/DateTime"
+import { TimeZone } from "../types/TimeZone"
+
+local VERSION_FORMAT = new StringDateFormat("yyyyMMddHHmmss", TimeZone.UTC)
+local USAGE = "status | diff | generate | migrate | up | down | rollback [steps] | auto"
+
+--- Collects the statements of one direction of a migration. Migrations written as functions receive it: up = function(m) m:sql("...") end
+export class MigrationContext
+
+  local _statements: string[] = {}
+
+  --- Adds a statement to run.
+  function sql(statement: string): void
+    table.insert(self._statements, statement)
+  end
+
+  --- Returns the collected statements.
+  function getStatements(): string[]
+    return self._statements
+  end
+end
+
+local function statementsOf(step: any): string[]
+  if step == nil then
+    return {}
+  end
+
+  if type(step) == "function" then
+    local context = new MigrationContext()
+    step(context)
+    return context:getStatements()
+  end
+
+  local statements: string[] = {}
+  for _, statement in ipairs(step) do
+    table.insert(statements, tostring(statement))
+  end
+
+  return statements
+end
+
+local function jsonString(text: string): string
+  local escaped, _ = string.gsub(text, "[%c\"\\]", function(char: string): string
+    if char == "\"" then
+      return "\\\""
+    elseif char == "\\" then
+      return "\\\\"
+    elseif char == "\n" then
+      return "\\n"
+    elseif char == "\t" then
+      return "\\t"
+    end
+
+    return string.format("\\u%04x", string.byte(char))
+  end)
+
+  return "\"" .. escaped .. "\""
+end
+
+local function jsonArray(statements: string[]): string
+  if #statements == 0 then
+    return "[]"
+  end
+
+  local lines: string[] = {}
+  for _, statement in ipairs(statements) do
+    table.insert(lines, "    " .. jsonString(statement))
+  end
+
+  return "[\n" .. table.concat(lines, ",\n") .. "\n  ]"
+end
+
+local function migrationJson(version: string, up: string[], down: string[]): string
+  return "{\n  \"version\": " .. jsonString(version) .. ",\n  \"up\": " .. jsonArray(up) .. ",\n  \"down\": " .. jsonArray(down) .. "\n}\n"
+end
+
+local function readFile(path: string): string
+  local file = new File(path, false)
+  local content = file:Read()
+  file:Close()
+  return content
+end
+
+local function writeFile(path: string, content: string): void
+  local file = new File(path, true)
+  file:Write(content)
+  file:Close()
+end
+
+--- Runs versioned schema changes like Doctrine Migrations. A migration has a version and the steps up and down,
+--- each either an array of SQL statements or a function receiving a MigrationContext.
+---
+--- generate writes the difference between the mapping and the database as JSON file VersionYYYYMMDDHHMMSS.json into the directory,
+--- since nanos world only lets packages write data files. The Migrator loads all such files of the directory by itself:
+---
+---     {
+---       "version": "20261017143005",
+---       "up": [ "ALTER TABLE \"player\" ADD COLUMN \"level\" INTEGER" ],
+---       "down": [ "ALTER TABLE \"player\" DROP COLUMN \"level\"" ]
+---     }
+---
+--- Migrations that need code, for example to move data, are registered in code with migrator:register and run in version order
+--- together with the files. Executed versions are stored in the table orm_migrations. Every migration runs in its own transaction where
+--- the database supports it, MySQL commits schema changes immediately though.
+---
+--- Options: directory (where migration files are read and written, relative to the server directory) and table (the version table).
+export class Migrator
+
+  local _entityManager: EntityManager
+  local _directory: string? = nil
+  local _tableName: string = "orm_migrations"
+  local _migrations: any[] = {}
+  local _byVersion: { [string]: any } = {}
+
+  constructor(entityManager: EntityManager, options: any = nil)
+    self._entityManager = entityManager
+    if options ~= nil then
+      self._directory = options.directory
+      self._tableName = options.table ?? "orm_migrations"
+    end
+  end
+
+  --- Registers migrations defined in code, given as single migration or array.
+  function register(migrations: any): void
+    local list: any[] = migrations
+    if type(migrations) == "table" and migrations.version ~= nil then
+      list = { migrations }
+    end
+
+    for _, migration in ipairs(list) do
+      local version = tostring(migration.version ?? "")
+      if string.match(version, "^%d+$") == nil then
+        error("A migration needs a numeric version, got '" .. version .. "'", 2)
+      end
+
+      if self._byVersion[version] ~= nil then
+        error("The migration " .. version .. " is registered twice", 2)
+      end
+
+      self._byVersion[version] = migration
+      table.insert(self._migrations, migration)
+    end
+
+    table.sort(self._migrations, function(left: any, right: any): boolean
+      return tostring(left.version) < tostring(right.version)
+    end)
+  end
+
+  --- Returns the registered migrations and the migration files of the directory ordered by version.
+  function getMigrations(): any[]
+    self:loadDirectory()
+    return self._migrations
+  end
+
+  --- Loads the migration files of the directory that are not registered yet. Called by every operation, so new files are picked up.
+  function loadDirectory(): void
+    local directory = self._directory
+    if directory == nil or not File.IsDirectory(directory) then
+      return
+    end
+
+    for _, path in ipairs(File.GetFiles(directory, ".json") ?? {}) do
+      local version = string.match(tostring(path), "Version(%d+)%.json$")
+      if version ~= nil and self._byVersion[version] == nil then
+        local ok, migration = pcall(function(): any
+          return JSON.parse(readFile(tostring(path)))
+        end)
+
+        if not ok or type(migration) ~= "table" or tostring(migration.version) ~= version then
+          error("The migration file " .. tostring(path) .. " is not a valid migration", 2)
+        end
+
+        migration.source = tostring(path)
+        self:register(migration)
+      end
+    end
+  end
+
+  --- Passes the difference between the mapping and the database to the callback: { up = string[], down = string[], warnings = string[] }.
+  function diff(callback: (any, string?) -> void): void
+    self._entityManager:getSchemaTool():getMigrationSql(callback)
+  end
+
+  --- Writes a migration file for the difference between the mapping and the database. The callback receives the path of the file.
+  function generate(callback: (string?, string?) -> void): void
+    local directory = self._directory
+    if directory == nil then
+      callback(nil, "Set the directory option of the Migrator to generate migrations")
+      return
+    end
+
+    self:executedVersions(function(state: any): void
+      if state.error ~= nil then
+        callback(nil, state.error)
+        return
+      end
+
+      local pending: string[] = {}
+      for _, migration in ipairs(self._migrations) do
+        local version = tostring(migration.version)
+        if not state.versions[version] then
+          table.insert(pending, version)
+        end
+      end
+
+      if #pending > 0 then
+        callback(nil, "Run the pending migrations first, otherwise the new one would repeat them: " .. table.concat(pending, ", "))
+        return
+      end
+
+      self:generateMigration(directory, callback)
+    end)
+  end
+
+  --- Passes the state of all migrations to the callback: { executed = string[], pending = string[], unknown = string[] }.
+  --- Unknown versions were executed but are not registered.
+  function status(callback: (any, string?) -> void): void
+    self:executedVersions(function(result: any): void
+      if result.error ~= nil then
+        callback(nil, result.error)
+        return
+      end
+
+      local executed: string[] = {}
+      local pending: string[] = {}
+      local unknown: string[] = {}
+      for _, migration in ipairs(self._migrations) do
+        local version = tostring(migration.version)
+        if result.versions[version] then
+          table.insert(executed, version)
+        else
+          table.insert(pending, version)
+        end
+      end
+
+      for _, version in ipairs(result.ordered) do
+        if self._byVersion[version] == nil then
+          table.insert(unknown, version)
+        end
+      end
+
+      callback({ executed = executed, pending = pending, unknown = unknown }, nil)
+    end)
+  end
+
+  --- Runs all pending migrations in order. The callback receives whether it succeeded, the error and the executed versions.
+  function migrate(callback: ((boolean, string?, string[]?) -> void)? = nil): void
+    self:runPending(nil, callback)
+  end
+
+  --- Runs the next pending migration.
+  function up(callback: ((boolean, string?, string[]?) -> void)? = nil): void
+    self:runPending(1, callback)
+  end
+
+  --- Reverts the last executed migration.
+  function down(callback: ((boolean, string?, string[]?) -> void)? = nil): void
+    self:rollback(1, callback)
+  end
+
+  --- Reverts the given number of executed migrations, starting with the newest. The callback receives the reverted versions.
+  function rollback(steps: number = 1, callback: ((boolean, string?, string[]?) -> void)? = nil): void
+    self:runRollback(steps, function(result: any): void
+      self:finish(callback, result)
+    end)
+  end
+
+  --- Registers the server console command, by default "orm", with the subcommands status, diff, generate, migrate, up, down, rollback and auto.
+  function registerCommands(name: string = "orm"): void
+    Console.RegisterCommand(name, function(subcommand: string?, argument: string?): void
+      self:runCommand(subcommand ?? "help", argument)
+    end, "nanos-orm schema migrations", { USAGE })
+  end
+
+  --- Runs a console subcommand and logs its result.
+  function runCommand(subcommand: string, argument: string? = nil): void
+    local command = string.lower(subcommand)
+    if command == "status" then
+      self:status(function(result: any, err: string?): void
+        if result == nil then
+          self:log("status failed: " .. tostring(err))
+          return
+        end
+
+        self:log("executed: " .. #result.executed .. ", pending: " .. #result.pending)
+        for _, version in ipairs(result.pending) do
+          self:log("  pending  " .. version)
+        end
+
+        for _, version in ipairs(result.unknown) do
+          self:log("  unknown  " .. version .. " (executed, but not registered)")
+        end
+      end)
+    elseif command == "diff" then
+      self:diff(function(result: any, err: string?): void
+        if result == nil then
+          self:log("diff failed: " .. tostring(err))
+          return
+        end
+
+        if #result.up == 0 then
+          self:log("the schema is in sync with the mapping")
+        end
+
+        for _, statement in ipairs(result.up) do
+          self:log("  " .. statement)
+        end
+
+        for _, warning in ipairs(result.warnings) do
+          self:log("  warning: " .. warning)
+        end
+      end)
+    elseif command == "generate" then
+      self:generate(function(path: string?, err: string?): void
+        self:log(path ~= nil and ("generated " .. path) or tostring(err))
+      end)
+    elseif command == "migrate" or command == "up" or command == "down" or command == "rollback" then
+      local callback = function(ok: boolean, err: string?, versions: string[]?): void
+        if not ok then
+          self:log(command .. " failed: " .. tostring(err))
+          return
+        end
+
+        local done = versions ?? {}
+        if #done == 0 then
+          self:log("nothing to do")
+        end
+
+        for _, version in ipairs(done) do
+          self:log((command == "migrate" or command == "up") and ("  migrated " .. version) or ("  reverted " .. version))
+        end
+      end
+
+      if command == "migrate" then
+        self:migrate(callback)
+      elseif command == "up" then
+        self:up(callback)
+      elseif command == "down" then
+        self:down(callback)
+      else
+        self:rollback(tonumber(argument) ?? 1, callback)
+      end
+    elseif command == "auto" then
+      self._entityManager:autoMigrate(function(ok: boolean, err: string?, warnings: string[]?): void
+        self:log(ok and "schema updated" or ("auto migration failed: " .. tostring(err)))
+        for _, warning in ipairs(warnings ?? {}) do
+          self:log("  warning: " .. warning)
+        end
+      end)
+    else
+      self:log("usage: " .. USAGE)
+    end
+  end
+
+  local function generateMigration(directory: string, callback: (string?, string?) -> void): void
+    self:diff(function(result: any, err: string?): void
+      if result == nil then
+        callback(nil, err)
+        return
+      end
+
+      if #result.up == 0 then
+        callback(nil, "The schema is in sync with the mapping, there is nothing to generate")
+        return
+      end
+
+      local ok, failure = pcall(function(): void
+        local version = self:nextVersion(directory)
+        local path = directory .. "/Version" .. version .. ".json"
+        File.CreateDirectory(directory)
+        writeFile(path, migrationJson(version, result.up, result.down))
+        self:loadDirectory()
+        callback(path, nil)
+      end)
+
+      if not ok then
+        callback(nil, "Writing the migration failed: " .. tostring(failure))
+      end
+    end)
+  end
+
+  local function log(message: string): void
+    Console.Log("%s", "[orm] " .. message)
+  end
+
+  local function finish(callback: ((boolean, string?, string[]?) -> void)?, result: any): void
+    if callback ~= nil then
+      callback(result.error == nil, result.error, result.versions)
+    elseif result.error ~= nil then
+      print("[nanos-orm] migration failed: " .. result.error)
+    end
+  end
+
+  local function getConnection(): Connection
+    return self._entityManager:getConnection()
+  end
+
+  local function nextVersion(directory: string): string
+    local version = DateTime.now(TimeZone.UTC):toString(VERSION_FORMAT)
+    while self._byVersion[version] ~= nil or File.Exists(directory .. "/Version" .. version .. ".json") do
+      version = tostring(math.tointeger((tonumber(version) ?? 0) + 1))
+    end
+
+    return version
+  end
+
+  local function runPending(limit: number?, callback: ((boolean, string?, string[]?) -> void)?): void
+    self:migrateForward(limit, function(result: any): void
+      self:finish(callback, result)
+    end)
+  end
+
+  local async function ensureTable(): string?
+    local connection = self:getConnection()
+    local platform = connection:getPlatform()
+    local sql = "CREATE TABLE IF NOT EXISTS " .. connection:quote(self._tableName) .. " ("
+      .. connection:quote("version") .. " " .. platform:getStringType(32) .. " NOT NULL, "
+      .. connection:quote("executed_at") .. " " .. platform:getStringType(32) .. " NOT NULL, "
+      .. "PRIMARY KEY (" .. connection:quote("version") .. "))"
+    local _, err = await connection:execute(sql, connection:createParams())
+    return err
+  end
+
+  local async function executedVersions(): any
+    self:loadDirectory()
+    local tableErr = await self:ensureTable()
+    if tableErr ~= nil then
+      return { error = tableErr }
+    end
+
+    local connection = self:getConnection()
+    local sql = "SELECT " .. connection:quote("version") .. " AS version FROM " .. connection:quote(self._tableName) .. " ORDER BY " .. connection:quote("version")
+    local rows, err = await connection:select(sql, connection:createParams())
+    if rows == nil then
+      return { error = err }
+    end
+
+    local versions: { [string]: boolean } = {}
+    local ordered: string[] = {}
+    for _, row in ipairs(rows) do
+      local version = tostring(row.version)
+      versions[version] = true
+      table.insert(ordered, version)
+    end
+
+    return { versions = versions, ordered = ordered }
+  end
+
+  local async function runStep(migration: any, direction: string): string?
+    local connection = self:getConnection()
+    local platform = connection:getPlatform()
+    local version = tostring(migration.version)
+    local ok, statements = pcall(statementsOf, migration[direction])
+    if not ok then
+      return "Building " .. direction .. " of " .. version .. " failed: " .. tostring(statements)
+    end
+
+    local transactional = connection:supportsTransactions()
+    if transactional then
+      local _, beginErr = await connection:execute(platform:getBeginTransactionSql(), connection:createParams())
+      if beginErr ~= nil then
+        return beginErr
+      end
+    end
+
+    local failure: string? = nil
+    for _, statement in ipairs(statements as string[]) do
+      local _, err = await connection:execute(statement, connection:createParams())
+      if err ~= nil then
+        failure = version .. " " .. direction .. " failed: " .. err .. " in: " .. statement
+        break
+      end
+    end
+
+    if failure == nil then
+      local params = connection:createParams()
+      local sql = ""
+      if direction == "up" then
+        sql = "INSERT INTO " .. connection:quote(self._tableName) .. " (" .. connection:quote("version") .. ", " .. connection:quote("executed_at") .. ") VALUES ("
+          .. params:add(version) .. ", " .. params:add(DateTime.now(TimeZone.UTC):toISOString()) .. ")"
+      else
+        sql = "DELETE FROM " .. connection:quote(self._tableName) .. " WHERE " .. connection:quote("version") .. " = " .. params:add(version)
+      end
+
+      local _, recordErr = await connection:execute(sql, params)
+      if recordErr ~= nil then
+        failure = recordErr
+      end
+    end
+
+    if failure ~= nil then
+      if transactional then
+        await connection:execute(platform:getRollbackSql(), connection:createParams())
+      end
+
+      return failure
+    end
+
+    if transactional then
+      local _, commitErr = await connection:execute(platform:getCommitSql(), connection:createParams())
+      return commitErr
+    end
+
+    return nil
+  end
+
+  local async function migrateForward(limit: number?): any
+    local state = await self:executedVersions()
+    if state.error ~= nil then
+      return { error = state.error }
+    end
+
+    local done: string[] = {}
+    for _, migration in ipairs(self._migrations) do
+      local version = tostring(migration.version)
+      if not state.versions[version] then
+        if limit ~= nil and #done >= limit then
+          break
+        end
+
+        local err = await self:runStep(migration, "up")
+        if err ~= nil then
+          return { error = err, versions = done }
+        end
+
+        table.insert(done, version)
+      end
+    end
+
+    return { versions = done }
+  end
+
+  local async function runRollback(steps: number): any
+    local state = await self:executedVersions()
+    if state.error ~= nil then
+      return { error = state.error }
+    end
+
+    local done: string[] = {}
+    for index = #state.ordered, 1, -1 do
+      if #done >= steps then
+        break
+      end
+
+      local version = state.ordered[index]
+      local migration = self._byVersion[version]
+      if migration == nil then
+        return { error = "The executed migration " .. version .. " is not registered and cannot be reverted", versions = done }
+      end
+
+      local err = await self:runStep(migration, "down")
+      if err ~= nil then
+        return { error = err, versions = done }
+      end
+
+      table.insert(done, version)
+    end
+
+    return { versions = done }
+  end
+end

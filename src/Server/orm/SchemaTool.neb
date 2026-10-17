@@ -1,0 +1,521 @@
+import { ColumnMetadata, EntityMetadata, MetadataRegistry, GenerationStrategy, RelationMetadata, RelationKind, IndexMetadata } from "./Metadata"
+import { Connection } from "../dbal/Connection"
+
+--- Creates, updates and drops the tables of all mapped entities, including foreign keys, their indexes and the join tables of ManyToMany relations.
+--- Tables are created after the tables they reference.
+---
+--- getMigrationSql compares the mapping with an existing database and returns the statements adding missing tables, columns, foreign keys
+--- and indexes, together with the statements reverting them. autoMigrate runs them directly and never drops anything.
+--- Columns that are NOT NULL in the mapping are added as nullable, since existing rows have no value for them, which is reported as warning.
+export class SchemaTool
+
+  local _connection: Connection
+  local _filter: ((EntityMetadata) -> boolean)? = nil
+
+  --- The filter decides which entities the schema operations manage, all of them without one.
+  constructor(connection: Connection, filter: ((EntityMetadata) -> boolean)? = nil)
+    self._connection = connection
+    self._filter = filter
+  end
+
+  --- Returns the CREATE TABLE statement for the given entity.
+  function getCreateTableSql(metadata: EntityMetadata): string
+    local platform = self._connection:getPlatform()
+    local definitions: string[] = {}
+    local constraints: string[] = {}
+    local primaryKey: string? = nil
+    for _, column in ipairs(metadata:getTableColumns()) do
+      local quoted = self._connection:quote(column.columnName)
+      local definition = quoted .. " " .. column:getColumnType():getSqlType(platform)
+      if column.isId and self:isIncrement(column) then
+        definition = platform:getIdentityColumnSql(quoted, column:getColumnType():getSqlType(platform))
+        if not platform:isIdentityPrimaryKeyInline() then
+          primaryKey = quoted
+        end
+      else
+        if not column.nullable or column.isId then
+          definition = definition .. " NOT NULL"
+        end
+
+        if column.unique and not column.isId then
+          definition = definition .. " UNIQUE"
+        end
+
+        if column.isId then
+          primaryKey = quoted
+        end
+      end
+
+      table.insert(definitions, definition)
+    end
+
+    for _, relation in ipairs(metadata.relations) do
+      if relation:hasJoinColumn() then
+        local column = relation:getJoinColumn()
+        local quoted = self._connection:quote(column.columnName)
+        local definition = quoted .. " " .. column:getColumnType():getSqlType(platform)
+        if not column.nullable then
+          definition = definition .. " NOT NULL"
+        end
+
+        if column.unique then
+          definition = definition .. " UNIQUE"
+        end
+
+        table.insert(definitions, definition)
+        table.insert(constraints, self:foreignKey(quoted, relation:getTarget(), relation.onDelete))
+      end
+    end
+
+    if primaryKey ~= nil then
+      table.insert(definitions, "PRIMARY KEY (" .. primaryKey .. ")")
+    end
+
+    if platform:supportsInlineIndexes() then
+      for _, index in ipairs(metadata.indexes) do
+        table.insert(definitions, platform:getInlineIndexSql(index:getName(metadata), self:quoteAll(index:getColumnNames(metadata)), index.unique))
+      end
+    end
+
+    for _, constraint in ipairs(constraints) do
+      table.insert(definitions, constraint)
+    end
+
+    return "CREATE TABLE IF NOT EXISTS " .. self._connection:quote(metadata.tableName) .. " (" .. table.concat(definitions, ", ") .. ")"
+  end
+
+  --- Returns the statements creating the indexes of the given entity: the declared indexes and unique constraints, unless the platform
+  --- declares them inside CREATE TABLE, and the foreign key indexes, unless the database creates them by itself.
+  --- Foreign keys that are unique or lead a declared index are covered by that index already.
+  function getIndexSql(metadata: EntityMetadata): string[]
+    local platform = self._connection:getPlatform()
+    local statements: string[] = {}
+    if not platform:supportsInlineIndexes() then
+      for _, index in ipairs(metadata.indexes) do
+        table.insert(statements, self:declaredIndexSql(metadata, index))
+      end
+    end
+
+    if platform:createsForeignKeyIndexes() then
+      return statements
+    end
+
+    for _, relation in ipairs(metadata.relations) do
+      if relation:hasJoinColumn() and self:needsForeignKeyIndex(metadata, relation:getJoinColumn()) then
+        local columnName = relation:getJoinColumn().columnName
+        table.insert(statements, platform:getCreateIndexSql("idx_" .. metadata.tableName .. "_" .. columnName, self._connection:quote(metadata.tableName), { self._connection:quote(columnName) }))
+      end
+    end
+
+    return statements
+  end
+
+  --- Returns the statements creating the join table of an owning ManyToMany relation and the index of its second column.
+  function getJoinTableSql(relation: RelationMetadata): string[]
+    local platform = self._connection:getPlatform()
+    local owner = relation:getOwner()
+    local target = relation:getTarget()
+    local tableName = relation:getJoinTableName()
+    local ownerColumn = self._connection:quote(relation:getOwningJoinTableColumn())
+    local targetColumn = self._connection:quote(relation:getInverseJoinTableColumn())
+    local definitions: string[] = {
+      ownerColumn .. " " .. owner:getIdColumn():getColumnType():getSqlType(platform) .. " NOT NULL",
+      targetColumn .. " " .. target:getIdColumn():getColumnType():getSqlType(platform) .. " NOT NULL",
+      "PRIMARY KEY (" .. ownerColumn .. ", " .. targetColumn .. ")",
+      self:foreignKey(ownerColumn, owner, "CASCADE"),
+      self:foreignKey(targetColumn, target, "CASCADE")
+    }
+    local statements: string[] = { "CREATE TABLE IF NOT EXISTS " .. self._connection:quote(tableName) .. " (" .. table.concat(definitions, ", ") .. ")" }
+    if not platform:createsForeignKeyIndexes() then
+      table.insert(statements, platform:getCreateIndexSql("idx_" .. tableName .. "_" .. relation:getInverseJoinTableColumn(), self._connection:quote(tableName), { targetColumn }))
+    end
+
+    return statements
+  end
+
+  --- Compares the mapping with the database and passes the changes to the callback without running them:
+  --- callback({ up = string[], down = string[], warnings = string[] }, error). down reverts up and is ordered to be run as is.
+  function getMigrationSql(callback: (any, string?) -> void): void
+    self:planUpdate(function(result: any): void
+      if result.error ~= nil then
+        callback(nil, result.error)
+        return
+      end
+
+      local up: string[] = {}
+      local down: string[] = {}
+      for _, change in ipairs(result.changes) do
+        table.insert(up, change.up)
+      end
+
+      for index = #result.changes, 1, -1 do
+        local revert = result.changes[index].down
+        if revert ~= nil then
+          table.insert(down, revert)
+        end
+      end
+
+      callback({ up = up, down = down, warnings = result.warnings }, nil)
+    end)
+  end
+
+  --- Adds missing tables, columns, foreign keys and indexes. Nothing is dropped. The callback receives whether it succeeded, the error and the warnings.
+  function autoMigrate(callback: ((boolean, string?, string[]?) -> void)? = nil): void
+    self:getMigrationSql(function(result: any, err: string?): void
+      if result == nil then
+        self:report(callback, err, nil)
+        return
+      end
+
+      if callback == nil then
+        for _, warning in ipairs(result.warnings) do
+          print("[nanos-orm] schema: " .. warning)
+        end
+      end
+
+      self:runStatements(result.up, function(runErr: string?): void
+        self:report(callback, runErr, result.warnings)
+      end)
+    end)
+  end
+
+  --- Returns the DROP TABLE statement for the given entity.
+  function getDropTableSql(metadata: EntityMetadata): string
+    return "DROP TABLE IF EXISTS " .. self._connection:quote(metadata.tableName)
+  end
+
+  --- Returns all statements creating the schema: entity tables after the tables they reference, then the join tables.
+  function getCreateSchemaSql(): string[]
+    local statements: string[] = {}
+    local entities = self:getEntities()
+    for _, metadata in ipairs(entities) do
+      table.insert(statements, self:getCreateTableSql(metadata))
+      for _, statement in ipairs(self:getIndexSql(metadata)) do
+        table.insert(statements, statement)
+      end
+    end
+
+    for _, relation in ipairs(self:getJoinTableRelations(entities)) do
+      for _, statement in ipairs(self:getJoinTableSql(relation)) do
+        table.insert(statements, statement)
+      end
+    end
+
+    return statements
+  end
+
+  --- Returns all statements dropping the schema: join tables first, then the entity tables in reverse dependency order.
+  function getDropSchemaSql(): string[]
+    local statements: string[] = {}
+    local entities = self:getEntities()
+    for _, relation in ipairs(self:getJoinTableRelations(entities)) do
+      table.insert(statements, "DROP TABLE IF EXISTS " .. self._connection:quote(relation:getJoinTableName()))
+    end
+
+    for index = #entities, 1, -1 do
+      table.insert(statements, self:getDropTableSql(entities[index]))
+    end
+
+    return statements
+  end
+
+  --- Creates the tables of all mapped entities that do not exist yet.
+  function createSchema(callback: ((boolean, string?) -> void)? = nil): void
+    self:runAll(self:getCreateSchemaSql(), callback)
+  end
+
+  --- Drops the tables of all mapped entities.
+  function dropSchema(callback: ((boolean, string?) -> void)? = nil): void
+    self:runAll(self:getDropSchemaSql(), callback)
+  end
+
+  local function report(callback: ((boolean, string?, string[]?) -> void)?, err: string?, warnings: string[]?): void
+    if callback ~= nil then
+      callback(err == nil, err, warnings)
+    elseif err ~= nil then
+      print("[nanos-orm] " .. err)
+    end
+  end
+
+  local function columnDefinition(column: ColumnMetadata, forAlter: boolean): string
+    local platform = self._connection:getPlatform()
+    local definition = self._connection:quote(column.columnName) .. " " .. column:getColumnType():getSqlType(platform)
+    if not forAlter and (not column.nullable or column.isId) then
+      definition = definition .. " NOT NULL"
+    end
+
+    if not forAlter and column.unique and not column.isId then
+      definition = definition .. " UNIQUE"
+    end
+
+    return definition
+  end
+
+  local function needsForeignKeyIndex(metadata: EntityMetadata, column: ColumnMetadata): boolean
+    if column.unique then
+      return false
+    end
+
+    for _, index in ipairs(metadata.indexes) do
+      if index:getColumnNames(metadata)[1] == column.columnName then
+        return false
+      end
+    end
+
+    return true
+  end
+
+  local function quoteAll(names: string[]): string[]
+    local result: string[] = {}
+    for _, name in ipairs(names) do
+      table.insert(result, self._connection:quote(name))
+    end
+
+    return result
+  end
+
+  local function declaredIndexSql(metadata: EntityMetadata, index: IndexMetadata): string
+    local platform = self._connection:getPlatform()
+    return platform:getCreateIndexSql(index:getName(metadata), self._connection:quote(metadata.tableName), self:quoteAll(index:getColumnNames(metadata)), index.unique)
+  end
+
+  local function references(target: EntityMetadata, onDelete: string?): string
+    local sql = "REFERENCES " .. self._connection:quote(target.tableName) .. " (" .. self._connection:quote(target:getIdColumn().columnName) .. ")"
+    if onDelete ~= nil then
+      sql = sql .. " ON DELETE " .. onDelete
+    end
+
+    return sql
+  end
+
+  local function foreignKey(quotedColumn: string, target: EntityMetadata, onDelete: string?): string
+    local sql = "FOREIGN KEY (" .. quotedColumn .. ") REFERENCES " .. self._connection:quote(target.tableName) .. " (" .. self._connection:quote(target:getIdColumn().columnName) .. ")"
+    if onDelete ~= nil then
+      sql = sql .. " ON DELETE " .. onDelete
+    end
+
+    return sql
+  end
+
+  local function getEntities(): EntityMetadata[]
+    local entities: EntityMetadata[] = {}
+    local allowed: { [any]: boolean } = {}
+    local filter = self._filter
+    for _, metadata in ipairs(MetadataRegistry.all()) do
+      if not metadata.isMappedSuperclass and metadata:getRootMetadata() == metadata and (filter == nil or filter(metadata)) then
+        local tableMetadata = metadata:getTableMetadata()
+        table.insert(entities, tableMetadata)
+        allowed[tableMetadata] = true
+      end
+    end
+
+    table.sort(entities, function(left: EntityMetadata, right: EntityMetadata): boolean
+      return left.tableName < right.tableName
+    end)
+
+    local ordered: EntityMetadata[] = {}
+    local state: { [any]: number } = {}
+    local function visit(metadata: EntityMetadata): void
+      if state[metadata] ~= nil then
+        return
+      end
+
+      state[metadata] = 1
+      for _, relation in ipairs(metadata.relations) do
+        if relation:hasJoinColumn() then
+          local target = relation:getTarget():getTableMetadata()
+          if target ~= metadata and allowed[target] then
+            visit(target)
+          end
+        end
+      end
+
+      state[metadata] = 2
+      table.insert(ordered, metadata)
+    end
+
+    for _, metadata in ipairs(entities) do
+      visit(metadata)
+    end
+
+    return ordered
+  end
+
+  local function getJoinTableRelations(entities: EntityMetadata[]): RelationMetadata[]
+    local result: RelationMetadata[] = {}
+    local seen: { [string]: boolean } = {}
+    for _, metadata in ipairs(entities) do
+      for _, relation in ipairs(metadata.relations) do
+        if relation.kind == RelationKind.ManyToMany and relation:isOwningSide() then
+          local tableName = relation:getJoinTableName()
+          if not seen[tableName] then
+            seen[tableName] = true
+            table.insert(result, relation)
+          end
+        end
+      end
+    end
+
+    return result
+  end
+
+  local function isIncrement(column: ColumnMetadata): boolean
+    return column.generation == GenerationStrategy.Auto and (column.typeRef == "integer" or column.typeRef == "bigint")
+  end
+
+  local function runAll(statements: string[], callback: ((boolean, string?) -> void)?): void
+    self:runStatements(statements, function(err: string?): void
+      if callback ~= nil then
+        callback(err == nil, err)
+      elseif err ~= nil then
+        print("[nanos-orm] " .. err)
+      end
+    end)
+  end
+
+  local async function listNames(sql: string, params: any): any
+    local rows, err = await self._connection:select(sql, params)
+    if rows == nil then
+      return { error = err }
+    end
+
+    local names: { [string]: boolean } = {}
+    for _, row in ipairs(rows) do
+      local name = row.name ?? row.NAME
+      if name ~= nil then
+        names[string.lower(tostring(name))] = true
+      end
+    end
+
+    return { names = names }
+  end
+
+  local async function planUpdate(): any
+    local platform = self._connection:getPlatform()
+    local changes: any[] = {}
+    local warnings: string[] = {}
+    local function change(up: string, down: string?): void
+      table.insert(changes, { up = up, down = down })
+    end
+
+    local tables = await self:listNames(platform:getListTablesSql(), self._connection:createParams())
+    if tables.error ~= nil then
+      return { error = tables.error }
+    end
+
+    local entities = self:getEntities()
+    for _, metadata in ipairs(entities) do
+      local quotedTable = self._connection:quote(metadata.tableName)
+      if not tables.names[string.lower(metadata.tableName)] then
+        change(self:getCreateTableSql(metadata), platform:getDropTableSql(quotedTable))
+        for _, statement in ipairs(self:getIndexSql(metadata)) do
+          change(statement, nil)
+        end
+      else
+        local params = self._connection:createParams()
+        local columns = await self:listNames(platform:getListColumnsSql(params:add(metadata.tableName)), params)
+        if columns.error ~= nil then
+          return { error = columns.error }
+        end
+
+        local mapped: { [string]: boolean } = {}
+        for _, column in ipairs(metadata:getTableColumns()) do
+          mapped[string.lower(column.columnName)] = true
+          if not columns.names[string.lower(column.columnName)] then
+            if column.isId then
+              table.insert(warnings, "The id column " .. metadata.tableName .. "." .. column.columnName .. " is missing and cannot be added to an existing table")
+            else
+              change(platform:getAddColumnSql(quotedTable, self:columnDefinition(column, true)), platform:getDropColumnSql(quotedTable, self._connection:quote(column.columnName)))
+              self:addColumnExtras(metadata, column, change, warnings)
+            end
+          end
+        end
+
+        for _, relation in ipairs(metadata.relations) do
+          if relation:hasJoinColumn() then
+            local column = relation:getJoinColumn()
+            local quotedColumn = self._connection:quote(column.columnName)
+            mapped[string.lower(column.columnName)] = true
+            if not columns.names[string.lower(column.columnName)] then
+              local definition = self:columnDefinition(column, true)
+              if not platform:supportsAddForeignKey() then
+                definition = definition .. " " .. self:references(relation:getTarget(), relation.onDelete)
+              end
+
+              change(platform:getAddColumnSql(quotedTable, definition), platform:getDropColumnSql(quotedTable, quotedColumn))
+              if platform:supportsAddForeignKey() then
+                local constraintName = "fk_" .. metadata.tableName .. "_" .. column.columnName
+                change(platform:getAddForeignKeySql(quotedTable, constraintName, self:foreignKey(quotedColumn, relation:getTarget(), relation.onDelete)), platform:getDropForeignKeySql(quotedTable, constraintName))
+              end
+
+              if self:needsForeignKeyIndex(metadata, column) and not platform:createsForeignKeyIndexes() then
+                local indexName = "idx_" .. metadata.tableName .. "_" .. column.columnName
+                change(platform:getCreateIndexSql(indexName, quotedTable, { quotedColumn }), platform:getDropIndexSql(indexName, quotedTable))
+              end
+
+              self:addColumnExtras(metadata, column, change, warnings)
+            end
+          end
+        end
+
+        for name, _ in pairs(columns.names) do
+          if not mapped[name] then
+            table.insert(warnings, "The column " .. metadata.tableName .. "." .. name .. " is not mapped and was kept")
+          end
+        end
+
+        if #metadata.indexes > 0 then
+          local indexParams = self._connection:createParams()
+          local indexes = await self:listNames(platform:getListIndexesSql(indexParams:add(metadata.tableName)), indexParams)
+          if indexes.error ~= nil then
+            return { error = indexes.error }
+          end
+
+          for _, index in ipairs(metadata.indexes) do
+            local indexName = index:getName(metadata)
+            if not indexes.names[string.lower(indexName)] then
+              change(self:declaredIndexSql(metadata, index), platform:getDropIndexSql(indexName, quotedTable))
+            end
+          end
+        end
+      end
+    end
+
+    for _, relation in ipairs(self:getJoinTableRelations(entities)) do
+      local tableName = relation:getJoinTableName()
+      if not tables.names[string.lower(tableName)] then
+        local statements = self:getJoinTableSql(relation)
+        change(statements[1], platform:getDropTableSql(self._connection:quote(tableName)))
+        for index = 2, #statements do
+          change(statements[index], nil)
+        end
+      end
+    end
+
+    return { changes = changes, warnings = warnings }
+  end
+
+  local function addColumnExtras(metadata: EntityMetadata, column: ColumnMetadata, change: (string, string?) -> void, warnings: string[]): void
+    local platform = self._connection:getPlatform()
+    if column.unique then
+      local quotedTable = self._connection:quote(metadata.tableName)
+      local indexName = "uniq_" .. metadata.tableName .. "_" .. column.columnName
+      change(platform:getCreateIndexSql(indexName, quotedTable, { self._connection:quote(column.columnName) }, true), platform:getDropIndexSql(indexName, quotedTable))
+    end
+
+    if not column.nullable then
+      table.insert(warnings, "The column " .. metadata.tableName .. "." .. column.columnName .. " was added as nullable, fill it and make it NOT NULL in a migration")
+    end
+  end
+
+  local async function runStatements(statements: string[]): string?
+    for index = 1, #statements do
+      local _, err = await self._connection:execute(statements[index], self._connection:createParams())
+      if err ~= nil then
+        return err .. " in: " .. statements[index]
+      end
+    end
+
+    return nil
+  end
+end

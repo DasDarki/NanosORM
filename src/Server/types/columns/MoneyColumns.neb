@@ -1,0 +1,71 @@
+import { ColumnType } from "../ColumnType"
+import { Platform } from "../../dbal/Platform"
+import { Decimal, RoundingMode } from "../Decimal"
+import { Money, Currency } from "../Money"
+
+--- Stores a Decimal with a fixed precision and scale. The value is passed as string, so it is never converted into a floating point number.
+export class DecimalColumn implements ColumnType<Decimal>
+
+  local _precision: number = 18
+  local _scale: number = 2
+  local _rounding: RoundingMode = RoundingMode.HalfUp
+
+  constructor(precision: number = 18, scale: number = 2, rounding: RoundingMode = RoundingMode.HalfUp)
+    self._precision = precision
+    self._scale = scale
+    self._rounding = rounding
+  end
+
+  function getSqlType(platform: Platform): string
+    return platform:getDecimalType(self._precision, self._scale)
+  end
+
+  function toDatabase(value: Decimal, platform: Platform): any
+    return value:setScale(self._scale, self._rounding):toString()
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Decimal?
+    if raw == nil then
+      return nil
+    end
+
+    local parsed = Decimal.parse(tostring(raw))
+    if parsed == nil then
+      return nil
+    end
+
+    return parsed:setScale(self._scale, self._rounding)
+  end
+end
+
+--- Stores Money as minor units, for example cents, in a BIGINT column. The currency is fixed per column and defaults to Currency.getDefault().
+export class MoneyColumn implements ColumnType<Money>
+
+  local _currency: Currency? = nil
+
+  constructor(currency: Currency? = nil)
+    self._currency = currency
+  end
+
+  function getSqlType(platform: Platform): string
+    return platform:getBigIntType()
+  end
+
+  function toDatabase(value: Money, platform: Platform): any
+    local currency = self._currency ?? Currency.getDefault()
+    if not value:getCurrency():equals(currency) then
+      error("Cannot store " .. value:getCurrency():getCode() .. " in a " .. currency:getCode() .. " column", 2)
+    end
+
+    return value:getMinorUnits()
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Money?
+    local minorUnits = math.tointeger(tonumber(raw) ?? 0.5)
+    if minorUnits == nil then
+      return nil
+    end
+
+    return Money.ofMinor(minorUnits, self._currency)
+  end
+end

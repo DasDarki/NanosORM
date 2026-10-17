@@ -1,0 +1,112 @@
+import { ColumnType } from "../ColumnType"
+import { Platform } from "../../dbal/Platform"
+import { Json } from "../Json"
+
+--- Defines whether an enum is stored by the name of its member or by its value.
+export enum EnumStorage
+  Name = 0
+  Value = 1
+end
+
+--- Stores a Json value, using a native JSON type where the platform has one. Read values are marked clean.
+export class JsonColumn<T> implements ColumnType<Json<T>>
+
+  function getSqlType(platform: Platform): string
+    return platform:getJsonType()
+  end
+
+  function toDatabase(value: Json<T>, platform: Platform): any
+    return value:stringify()
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Json<T>?
+    if raw == nil then
+      return nil
+    elseif raw is table then
+      local result = new Json(raw as T)
+      result:markClean()
+      return result
+    end
+
+    return Json.parse(tostring(raw)) as Json<T>?
+  end
+end
+
+--- Stores a member of a Nebra enum, either by its name, which survives reordering the enum, or by its value.
+export class EnumColumn<T> implements ColumnType<T>
+
+  local _enum: any = nil
+  local _storage: EnumStorage = EnumStorage.Name
+  local _length: number = 64
+
+  --- Creates a column for the given enum, for example new EnumColumn(DayOfWeek).
+  constructor(enumTable: any, storage: EnumStorage = EnumStorage.Name, length: number = 64)
+    self._enum = enumTable
+    self._storage = storage
+    self._length = length
+  end
+
+  local function nameOf(value: any): string?
+    for key, member in pairs(self._enum) do
+      if member == value and key ~= value then
+        return key as string
+      end
+    end
+
+    return nil
+  end
+
+  local function hasNumericValues(): boolean
+    for key, member in pairs(self._enum) do
+      if type(member) ~= "number" and type(key) ~= "number" then
+        return false
+      end
+    end
+
+    return true
+  end
+
+  function getSqlType(platform: Platform): string
+    if self._storage == EnumStorage.Value and self:hasNumericValues() then
+      return platform:getIntegerType()
+    end
+
+    return platform:getStringType(self._length)
+  end
+
+  function toDatabase(value: T, platform: Platform): any
+    if self._storage == EnumStorage.Value then
+      return value
+    end
+
+    local name = self:nameOf(value)
+    if name == nil then
+      error("Value " .. tostring(value) .. " is not a member of the enum", 2)
+    end
+
+    return name
+  end
+
+  function fromDatabase(raw: any, platform: Platform): T?
+    if raw == nil then
+      return nil
+    end
+
+    if self._storage == EnumStorage.Name then
+      local name = tostring(raw)
+      local member = self._enum[name]
+      if member == nil or self:nameOf(member) ~= name then
+        return nil
+      end
+
+      return member as T
+    end
+
+    local value = tonumber(raw) ?? tostring(raw)
+    if self:nameOf(value) == nil then
+      return nil
+    end
+
+    return value as T
+  end
+end

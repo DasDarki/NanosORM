@@ -1,0 +1,45 @@
+import { ColumnType } from "../ColumnType"
+import { Platform } from "../../dbal/Platform"
+import { Uuid } from "../Uuid"
+import { SteamId } from "../SteamId"
+
+--- Stores a Uuid in its canonical form, using a native UUID type where the platform has one.
+export class UuidColumn implements ColumnType<Uuid>
+
+  function getSqlType(platform: Platform): string
+    return platform:getUuidType()
+  end
+
+  function toDatabase(value: Uuid, platform: Platform): any
+    return value:toString()
+  end
+
+  function fromDatabase(raw: any, platform: Platform): Uuid?
+    if raw == nil then
+      return nil
+    end
+
+    return Uuid.parse(tostring(raw))
+  end
+end
+
+--- Stores a SteamId as SteamID64 string. A BIGINT column is avoided on purpose, since database drivers may hand the value over
+--- as a double, which cannot represent SteamID64 values exactly.
+export class SteamIdColumn implements ColumnType<SteamId>
+
+  function getSqlType(platform: Platform): string
+    return platform:getStringType(20)
+  end
+
+  function toDatabase(value: SteamId, platform: Platform): any
+    return value:toSteam64()
+  end
+
+  function fromDatabase(raw: any, platform: Platform): SteamId?
+    if raw == nil then
+      return nil
+    end
+
+    return SteamId.parse(tostring(raw))
+  end
+end

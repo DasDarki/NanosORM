@@ -1,0 +1,257 @@
+--- The kinds of conditions an Expression can describe.
+export enum ExpressionKind
+  Compare = "compare"
+  In = "in"
+  Null = "null"
+  Between = "between"
+  Like = "like"
+  Group = "group"
+  Not = "not"
+end
+
+--- A condition in criteria that is more than a plain equality.
+---
+--- Field conditions are used as value of a field: { level = Expr.gt(5), deletedBy = Expr.isNull() }.
+--- Groups combine whole criteria tables and are added as array entries: { level = 1, Expr.anyOf({ username = "a" }, { username = "b" }) }.
+export class Expression
+
+  --- The kind of the condition.
+  kind: ExpressionKind
+
+  --- The SQL operator of compare and group conditions, for example ">" or "OR".
+  comparison: string = ""
+
+  --- The values the condition compares with.
+  values: any[] = {}
+
+  --- Whether the condition is negated.
+  negated: boolean = false
+
+  --- Whether a like condition ignores the case.
+  caseInsensitive: boolean = false
+
+  --- The criteria tables of group and not conditions.
+  children: any[] = {}
+
+  constructor(kind: ExpressionKind)
+    self.kind = kind
+  end
+
+  --- Returns whether the given value is an Expression.
+  static function isExpression(value: any): boolean
+    return type(value) == "table" and getmetatable(value) == Expression
+  end
+end
+
+local function compare(comparison: string, value: any): Expression
+  if value == nil then
+    error("Use Expr.isNull or Expr.isNotNull to compare with nil", 3)
+  end
+
+  local expression = new Expression(ExpressionKind.Compare)
+  expression.comparison = comparison
+  expression.values = { value }
+  return expression
+end
+
+local function likePattern(pattern: string, negated: boolean, caseInsensitive: boolean): Expression
+  local expression = new Expression(ExpressionKind.Like)
+  expression.values = { pattern }
+  expression.negated = negated
+  expression.caseInsensitive = caseInsensitive
+  return expression
+end
+
+local function escapeLike(text: string): string
+  local escaped, _ = string.gsub(text, "[\\%%_]", "\\%0")
+  return escaped
+end
+
+local function group(comparison: string, criteria: any[]): Expression
+  if #criteria == 0 then
+    error("A group needs at least one criteria table", 3)
+  end
+
+  local expression = new Expression(ExpressionKind.Group)
+  expression.comparison = comparison
+  expression.children = criteria
+  return expression
+end
+
+--- Creates the conditions used in criteria. Exported as NanosORM.Expr.
+export class Expr
+
+  --- Matches values equal to the given one.
+  static function eq(value: any): Expression
+    return compare("=", value)
+  end
+
+  --- Matches values different from the given one. Rows where the column is NULL never match.
+  static function neq(value: any): Expression
+    return compare("<>", value)
+  end
+
+  --- Matches values greater than the given one.
+  static function gt(value: any): Expression
+    return compare(">", value)
+  end
+
+  --- Matches values greater than or equal to the given one.
+  static function gte(value: any): Expression
+    return compare(">=", value)
+  end
+
+  --- Matches values less than the given one.
+  static function lt(value: any): Expression
+    return compare("<", value)
+  end
+
+  --- Matches values less than or equal to the given one.
+  static function lte(value: any): Expression
+    return compare("<=", value)
+  end
+
+  --- Matches values between both bounds, including them.
+  static function between(lower: any, upper: any): Expression
+    if lower == nil or upper == nil then
+      error("between needs a lower and an upper bound", 2)
+    end
+
+    local expression = new Expression(ExpressionKind.Between)
+    expression.values = { lower, upper }
+    return expression
+  end
+
+  --- Matches any of the given values. A plain array as criteria value does the same.
+  static function isIn(values: any[]): Expression
+    local expression = new Expression(ExpressionKind.In)
+    expression.values = values
+    return expression
+  end
+
+  --- Matches none of the given values.
+  static function notIn(values: any[]): Expression
+    local expression = Expr.isIn(values)
+    expression.negated = true
+    return expression
+  end
+
+  --- Matches NULL columns.
+  static function isNull(): Expression
+    return new Expression(ExpressionKind.Null)
+  end
+
+  --- Matches columns that are not NULL.
+  static function isNotNull(): Expression
+    local expression = new Expression(ExpressionKind.Null)
+    expression.negated = true
+    return expression
+  end
+
+  --- Matches an SQL LIKE pattern, where % matches any text and _ a single character. The case sensitivity depends on the database.
+  static function like(pattern: string): Expression
+    return likePattern(pattern, false, false)
+  end
+
+  --- Matches values that do not match an SQL LIKE pattern.
+  static function notLike(pattern: string): Expression
+    return likePattern(pattern, true, false)
+  end
+
+  --- Matches an SQL LIKE pattern ignoring the case on every database.
+  static function iLike(pattern: string): Expression
+    return likePattern(pattern, false, true)
+  end
+
+  --- Matches values containing the given text, ignoring the case. % and _ are matched literally.
+  static function contains(text: string): Expression
+    return likePattern("%" .. escapeLike(text) .. "%", false, true)
+  end
+
+  --- Matches values starting with the given text, ignoring the case. % and _ are matched literally.
+  static function startsWith(text: string): Expression
+    return likePattern(escapeLike(text) .. "%", false, true)
+  end
+
+  --- Matches values ending with the given text, ignoring the case. % and _ are matched literally.
+  static function endsWith(text: string): Expression
+    return likePattern("%" .. escapeLike(text), false, true)
+  end
+
+  --- Matches rows matching at least one of the given criteria tables.
+  static function anyOf(...criteria: any): Expression
+    return group("OR", { ... })
+  end
+
+  --- Matches rows matching all of the given criteria tables.
+  static function allOf(...criteria: any): Expression
+    return group("AND", { ... })
+  end
+
+  --- Matches rows not matching the given criteria table.
+  static function negate(criteria: any): Expression
+    local expression = new Expression(ExpressionKind.Not)
+    expression.children = { criteria }
+    return expression
+  end
+end
+
+--- An aggregate function over a field, used in the select of aggregate queries.
+export class Aggregate
+
+  --- The SQL function, one of COUNT, SUM, AVG, MIN and MAX.
+  func: string
+
+  --- The field the function is applied to, nil for COUNT(*). Paths through to-one relations like "guild.level" are allowed.
+  field: string? = nil
+
+  --- Whether only distinct values are aggregated.
+  distinct: boolean = false
+
+  constructor(func: string, field: string?, distinct: boolean)
+    self.func = func
+    self.field = field
+    self.distinct = distinct
+  end
+
+  --- Returns whether the given value is an Aggregate.
+  static function isAggregate(value: any): boolean
+    return type(value) == "table" and getmetatable(value) == Aggregate
+  end
+end
+
+--- Creates the aggregate functions used in the select of aggregate queries. Exported as NanosORM.Agg.
+---
+---     local rows = await repository:aggregate({ select = { guild = "guild", members = Agg.count(), level = Agg.avg("level") }, groupBy = { "guild" } })
+export class Agg
+
+  --- Counts the rows, or the rows where the field is not NULL.
+  static function count(field: string? = nil): Aggregate
+    return new Aggregate("COUNT", field, false)
+  end
+
+  --- Counts the distinct values of the field.
+  static function countDistinct(field: string): Aggregate
+    return new Aggregate("COUNT", field, true)
+  end
+
+  --- Sums the values of the field.
+  static function sum(field: string): Aggregate
+    return new Aggregate("SUM", field, false)
+  end
+
+  --- Averages the values of the field.
+  static function avg(field: string): Aggregate
+    return new Aggregate("AVG", field, false)
+  end
+
+  --- Returns the smallest value of the field, converted to the type of the field.
+  static function min(field: string): Aggregate
+    return new Aggregate("MIN", field, false)
+  end
+
+  --- Returns the largest value of the field, converted to the type of the field.
+  static function max(field: string): Aggregate
+    return new Aggregate("MAX", field, false)
+  end
+end
